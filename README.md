@@ -24,7 +24,9 @@ python3 demo.py
 
 `test_rpc.py` 保留普通调用回归；`test_streams_acceptance.py` 全部使用真实
 `socketpair` 和事件门，覆盖题目要求的三个时序场景，以及前缀错误隔离、
-窗口上限、未配置流处理器和断线清理。
+窗口上限、未配置流处理器和断线清理。`test_delivery_acceptance.py` 用真实
+`socketpair` 和事件门覆盖补领台账：断线后换连接补领、容量/执行位门控、
+冲突与待完成、失败终态和未启用台账时的拒绝。
 
 应输出 `reply order: FAST SLOW` 和 `isolated error: handler failed`。
 
@@ -95,6 +97,78 @@ serve(
 `RemoteError("server streams busy")`，且不会调用生产器；它与普通调用的
 `server busy` 相互独立。
 
+## 断线后补领回执（台账）
+
+普通 `submit()`、`open_stream()` 和旧的三种帧不使用台账。若调用会带来副作用、
+且连接可能在处理函数已经开始后被断开，则改用带业务编号的补领接口：
+
+```python
+from rpc import Client, DeliveryLedger, serve
+
+ledger = DeliveryLedger(capacity=8)          # 1..64 条未确认指令
+
+def handler(payload):                        # 同一个普通处理函数
+    ...
+
+server = Thread(
+    target=serve,
+    args=(sock, handler),
+    kwargs={"ledger": ledger},               # 可选关键字参数
+)
+```
+
+```python
+future = client.submit_delivery(seq, payload)   # 返回 future
+result = future.result(timeout=2)
+client.confirm_delivery(seq).result(2)          # 确认收讫，释放名额
+```
+
+- `seq` 是独立的业务编号，必须为 1 到 2⁶⁴−1 的整数（`bool` 不接受）；正文
+  是最多 65528 字节的 `bytes`。非法本地参数立即抛 `ValueError`，不发送帧、
+  不占用在途名额。
+- 两个方法都像 `submit()` 一样返回 future，并共用客户端原有的
+  `max_pending` 在途上限和请求 ID 序列。
+- 未配置台账的服务端对这两个方法回复
+  `RemoteError("delivery unavailable")`，连接保持可用。
+
+用一条 `DeliveryLedger` 表示同一生产者的一条指令序列；多个同时存在或先后
+接入的连接可以共享它，并使用同一个业务处理函数。一条指令被接单后，台账
+保证它恰好执行一次，即使原连接已经断开。
+
+### 何时补领、何时确认
+
+生产者拿到终态（`future` 的正常结果，或 `handler failed` 这类
+`RemoteError`）后即可调用 `confirm_delivery(seq)` 释放名额。若连接在处理
+过程中断开、`future` 得到 `PeerClosed`，生产者重连后应先用原编号和原正文
+再次 `submit_delivery(seq, payload)` 补领：
+
+- 正文相同：已接单的指令按台账处理。仍在运行可能立即得到
+  `"delivery pending"`（稍后再补领），也可能保留该请求等到终态，并在同一次
+  future 上收到同一个终态；已有终态则直接返回原结果。
+- `"delivery conflict"`：编号已接单但正文不同，原记录不变。
+- `"delivery retired"`：编号已被确认或曾跳过，不会再次执行。
+- `"delivery full"`：台账未确认记录已达 `capacity`。
+- `"server busy"`：台账有名额，但当前连接没有空闲执行位。
+- `"delivery unknown"`：确认一个从未接单、且大于最高已接单编号的序列。
+
+确认运行中的指令得到 `"delivery pending"` 且不释放名额；确认已完成的指令
+返回空 `bytes` 并释放名额。对已确认或曾跳过的编号再次确认幂等返回空
+`bytes`，不会挤掉其他编号的记录。
+
+### 名额与执行位
+
+已接单而未确认的指令始终占一个台账名额；台账最多保存 `capacity` 条这样的
+记录（正文和终态各不超过一个普通帧的负载上限），另加最高已接单编号等少量
+固定状态，不保存完整历史。新指令只有在编号大于最高已接单编号、台账有名额
+且当前连接有空闲执行位时才接单并调用处理函数；未接单不会推进最高编号、
+占用台账名额或调用处理函数，之后可用同一编号重试。
+
+台账只对已接单指令复用当前连接原有的 `workers` 执行位，不另加并发能力；
+补领与确认不占执行位，也不占用等待中的请求。台账只在当前进程内有效：
+进程重启后 `DeliveryLedger` 为空，服务端无法识别重启前已执行的编号，因此
+不提供跨重启的去重保证；它也不做磁盘恢复、自动重连或自动重试——重连和
+补领由生产者主动完成。
+
 ## 执行位、窗口和名额
 
 普通 handler，以及流生产器的创建、每次 `next()` 推进和迭代器 `close()`
@@ -147,6 +221,8 @@ serve(
 | `STREAM_END` | 6 | S→C | 空；正常 EOF 或放弃确认 |
 | `STREAM_CANCEL` | 7 | C→S | 空；本地放弃 |
 | `STREAM_CREDIT` | 8 | C→S | 空；`read()` 取走一块后归还一个窗口份额 |
+| `DELIVERY_SUBMIT` | 9 | C→S | 8 字节大端序列号后接最多 65528 字节正文；回复复用 `RESULT`/`ERROR` |
+| `DELIVERY_CONFIRM` | 10 | C→S | 恰好 8 字节大端序列号；回复复用 `RESULT`/`ERROR` |
 
 没有远端自动重连或身份认证；处理函数和 future 回调由调用方信任，且必须
 能够返回。回调不要阻塞、同步等待其他 RPC 结果或再次提交 RPC。底层对端

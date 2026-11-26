@@ -7,7 +7,13 @@ REQUEST, RESULT, ERROR = 1, 2, 3
 # stream frames have empty bodies.
 STREAM_OPEN, STREAM_DATA, STREAM_END = 4, 5, 6
 STREAM_CANCEL, STREAM_CREDIT = 7, 8
+# Delivery extension.  DELIVERY_SUBMIT's body is an 8-byte sequence followed
+# by a payload, so the payload is at most 65528 bytes.  DELIVERY_CONFIRM's
+# body is exactly one 8-byte sequence.  Replies reuse RESULT/ERROR.
+DELIVERY_SUBMIT, DELIVERY_CONFIRM = 9, 10
+DELIVERY_SEQ_SIZE = 8
 MAX_PAYLOAD = 65536
+DELIVERY_MAX_PAYLOAD = MAX_PAYLOAD - DELIVERY_SEQ_SIZE
 MAX_CHUNK = MAX_PAYLOAD
 MAX_WINDOW = 16
 MAX_STREAM_SLOTS = 32
@@ -23,6 +29,8 @@ _FRAME_KINDS = frozenset(
         STREAM_END,
         STREAM_CANCEL,
         STREAM_CREDIT,
+        DELIVERY_SUBMIT,
+        DELIVERY_CONFIRM,
     }
 )
 _EMPTY_BODY_KINDS = frozenset({STREAM_END, STREAM_CANCEL, STREAM_CREDIT})
@@ -58,6 +66,13 @@ def receive(sock):
     elif kind in _EMPTY_BODY_KINDS:
         if length != 0:
             raise ProtocolError("invalid stream control frame")
+    elif kind == DELIVERY_SUBMIT:
+        # Sequence number plus a payload; the sum stays within MAX_PAYLOAD.
+        if length < DELIVERY_SEQ_SIZE or length > MAX_PAYLOAD:
+            raise ProtocolError("invalid delivery submit frame")
+    elif kind == DELIVERY_CONFIRM:
+        if length != DELIVERY_SEQ_SIZE:
+            raise ProtocolError("invalid delivery confirm frame")
     elif length > MAX_PAYLOAD:
         raise ProtocolError("invalid frame header")
     return kind, request_id, read_exact(sock, length)

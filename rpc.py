@@ -3,6 +3,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import count
 import socket
+from struct import Struct
 from threading import (
     BoundedSemaphore,
     Condition,
@@ -14,6 +15,10 @@ from threading import (
 from time import monotonic
 
 from wire import (
+    DELIVERY_CONFIRM,
+    DELIVERY_MAX_PAYLOAD,
+    DELIVERY_SEQ_SIZE,
+    DELIVERY_SUBMIT,
     ERROR,
     MAX_PAYLOAD,
     MAX_STREAM_SLOTS,
@@ -60,6 +65,56 @@ def _terminate(sock):
 
 def _payload(payload):
     return isinstance(payload, bytes) and len(payload) <= MAX_PAYLOAD
+
+
+def _delivery_seq(seq):
+    return type(seq) is int and 1 <= seq < (1 << 64)
+
+
+class DeliveryLedger:
+    """Process-local record of accepted, still-unconfirmed instructions.
+
+    One ledger represents one producer's sequence of delivery instructions and
+    may be shared by several concurrent or successive connections.  It keeps
+    only unconfirmed records (at most *capacity*) plus the highest accepted
+    sequence number; it performs no persistence and no automatic retry.
+    """
+
+    __slots__ = ("_capacity", "_cond", "_records", "_highest")
+
+    def __init__(self, capacity):
+        if type(capacity) is not int or not 1 <= capacity <= 64:
+            raise ValueError("capacity must be an integer from 1 to 64")
+        self._capacity = capacity
+        self._cond = Condition()
+        self._records = {}
+        self._highest = 0
+
+
+class _DeliveryRecord:
+    __slots__ = ("seq", "payload", "done", "failed", "value", "waiter")
+
+    def __init__(self, seq, payload):
+        self.seq = seq
+        self.payload = payload
+        self.done = False
+        self.failed = False
+        self.value = b""
+        self.waiter = None
+
+
+class _DeliveryWaiter:
+    __slots__ = ("request_id", "record", "abandoned", "event", "thread")
+
+    def __init__(self, request_id, record):
+        self.request_id = request_id
+        self.record = record
+        self.abandoned = False
+        self.event = Event()
+        self.thread = None
+
+
+_SEQ = Struct(">Q")
 
 
 class Stream:
@@ -250,7 +305,25 @@ class Client:
     def submit(self, payload):
         if not _payload(payload):
             raise ValueError("expected up to 65536 bytes")
+        return self._submit_frame(REQUEST, b"", payload)
 
+    def submit_delivery(self, seq, payload):
+        """Submit a ledger-backed instruction under business sequence *seq*."""
+        if not _delivery_seq(seq):
+            raise ValueError("seq must be an integer from 1 to 2**64-1")
+        if not isinstance(payload, bytes) or len(payload) > DELIVERY_MAX_PAYLOAD:
+            raise ValueError("expected up to 65528 bytes")
+        return self._submit_frame(
+            DELIVERY_SUBMIT, _SEQ.pack(seq), payload
+        )
+
+    def confirm_delivery(self, seq):
+        """Confirm receipt of a terminal delivery result, freeing its slot."""
+        if not _delivery_seq(seq):
+            raise ValueError("seq must be an integer from 1 to 2**64-1")
+        return self._submit_frame(DELIVERY_CONFIRM, _SEQ.pack(seq), b"")
+
+    def _submit_frame(self, kind, prefix, payload):
         send_error = None
         with self._sending:
             request_id = self._allocate()
@@ -258,7 +331,7 @@ class Client:
             future.set_running_or_notify_cancel()
             self._insert(request_id, future)
             try:
-                send(self._sock, REQUEST, request_id, payload)
+                send(self._sock, kind, request_id, prefix + payload)
             except OSError as exc:
                 send_error = exc
                 _terminate(self._sock)
@@ -408,12 +481,15 @@ def serve(
     workers=2,
     stream_handler=None,
     stream_slots=8,
+    ledger=None,
 ):
-    """Own sock; answer ordinary calls and bounded streams.
+    """Own sock; answer ordinary calls, bounded streams, and deliveries.
 
     Ordinary handlers and stream creation/advancement/cleanup share the
     *workers* execution permits.  stream_slots bounds admitted streams,
-    including streams paused solely because their reader is slow.
+    including streams paused solely because their reader is slow.  When a
+    DeliveryLedger is supplied, delivery submissions use that ledger and the
+    same ordinary handler; the ledger survives this connection.
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be positive")
@@ -424,6 +500,8 @@ def serve(
         raise ValueError(
             f"stream_slots must be an integer from 1 to {MAX_STREAM_SLOTS}"
         )
+    if ledger is not None and not isinstance(ledger, DeliveryLedger):
+        raise ValueError("ledger must be a DeliveryLedger or None")
 
     writing = Lock()
     work_slots = BoundedSemaphore(workers)
@@ -433,10 +511,24 @@ def serve(
     streams_lock = Lock()
     runner_threads = set()
     threads_lock = Lock()
+    delivery_waiters = set()
+    delivery_waiters_lock = Lock()
 
     def write_frame(kind, request_id, body=b""):
         with writing:
             send(sock, kind, request_id, body)
+
+    def send_error(request_id, message):
+        try:
+            write_frame(ERROR, request_id, message)
+        except OSError:
+            _terminate(sock)
+
+    def send_result(request_id, body):
+        try:
+            write_frame(RESULT, request_id, body)
+        except OSError:
+            _terminate(sock)
 
     def handle_request(request_id, body):
         try:
@@ -452,6 +544,217 @@ def serve(
             _terminate(sock)
         finally:
             work_slots.release()
+
+    # ---- delivery ledger integration ----
+
+    def send_terminal(request_id, record):
+        if record.failed:
+            send_error(request_id, b"handler failed")
+        else:
+            send_result(request_id, record.value)
+
+    def run_delivery(record, request_id):
+        # One admitted instruction runs the ordinary handler exactly once,
+        # even if the submitting connection has already gone away.
+        try:
+            try:
+                value = handler(record.payload)
+                if not _payload(value):
+                    raise ValueError("invalid handler response")
+                failed = False
+            except Exception:
+                value, failed = b"handler failed", True
+
+            waiter = None
+            with ledger._cond:
+                record.done = True
+                record.failed = failed
+                record.value = value
+                waiter = record.waiter
+                record.waiter = None
+                if waiter is not None:
+                    # A claim registered while the instruction was running is
+                    # entitled to this terminal state, even if the record is
+                    # confirmed and retired later on another connection.
+                    waiter.event.set()
+            # The record is already terminal; delivery on a still-live
+            # submitting connection is best effort and never gates readiness.
+            send_terminal(request_id, record)
+        finally:
+            work_slots.release()
+
+    def run_delivery_waiter(waiter):
+        try:
+            waiter.event.wait()
+            if waiter.abandoned:
+                return
+            send_terminal(waiter.request_id, waiter.record)
+        finally:
+            with delivery_waiters_lock:
+                delivery_waiters.discard(waiter)
+
+    def attach_delivery_waiter(request_id, record):
+        waiter = _DeliveryWaiter(request_id, record)
+        with ledger._cond:
+            if record.done:
+                outcome = "done"
+            elif record.waiter is not None or stopping.is_set():
+                outcome = "pending"
+            else:
+                record.waiter = waiter
+                outcome = "wait"
+
+        if outcome == "done":
+            send_terminal(request_id, record)
+            return
+        if outcome == "pending":
+            send_error(request_id, b"delivery pending")
+            return
+
+        thread = Thread(
+            target=run_delivery_waiter,
+            args=(waiter,),
+            name=f"rpc-delivery-wait-{request_id}",
+            daemon=True,
+        )
+        waiter.thread = thread
+        with delivery_waiters_lock:
+            delivery_waiters.add(waiter)
+        try:
+            thread.start()
+        except Exception:
+            # Unable to park a request; the instruction itself is unaffected.
+            waiter.abandoned = True
+            with ledger._cond:
+                if record.waiter is waiter:
+                    record.waiter = None
+            with delivery_waiters_lock:
+                delivery_waiters.discard(waiter)
+            send_error(request_id, b"delivery pending")
+
+    def existing_delivery_locked(seq, payload):
+        """Classify a submission for an already-accepted sequence.
+
+        Returns (action, record) where action is "retired", "conflict",
+        "done", "pending", or "wait".
+        """
+        record = ledger._records.get(seq)
+        if record is None:
+            return "retired", None
+        if record.payload != payload:
+            return "conflict", None
+        if record.done:
+            return "done", record
+        if record.waiter is not None:
+            return "pending", None
+        return "wait", record
+
+    def classify_submission_locked(seq, payload):
+        """Classify a delivery submission while holding the ledger lock."""
+        if seq <= ledger._highest:
+            return existing_delivery_locked(seq, payload)
+        if len(ledger._records) >= ledger._capacity:
+            return "full", None
+        return "admit", None
+
+    def reply_submission(request_id, action, record):
+        """Reply for every non-fresh submission action; returns True if handled."""
+        if action == "admit":
+            return False
+        if action == "retired":
+            send_error(request_id, b"delivery retired")
+        elif action == "conflict":
+            send_error(request_id, b"delivery conflict")
+        elif action == "full":
+            send_error(request_id, b"delivery full")
+        elif action == "done":
+            send_terminal(request_id, record)
+        elif action == "pending":
+            send_error(request_id, b"delivery pending")
+        elif action == "wait":
+            attach_delivery_waiter(request_id, record)
+        return True
+
+    def handle_delivery_submit(request_id, body):
+        if ledger is None:
+            send_error(request_id, b"delivery unavailable")
+            return
+        seq = _SEQ.unpack_from(body)[0]
+        payload = body[DELIVERY_SEQ_SIZE:]
+
+        with ledger._cond:
+            action, record = classify_submission_locked(seq, payload)
+        if reply_submission(request_id, action, record):
+            return
+
+        # Fresh instruction: it needs one of this connection's execution
+        # slots before it may occupy a ledger record.
+        if not work_slots.acquire(blocking=False):
+            # Another connection may have admitted this sequence meanwhile.
+            # An already-accepted instruction is handled by the ledger and
+            # never needs a slot for its claim.
+            with ledger._cond:
+                action, record = classify_submission_locked(seq, payload)
+            if reply_submission(request_id, action, record):
+                return
+            send_error(request_id, b"server busy")
+            return
+
+        with ledger._cond:
+            previous_highest = ledger._highest
+            action, record = classify_submission_locked(seq, payload)
+            if action == "admit":
+                if stopping.is_set():
+                    action, record = "busy", None
+                else:
+                    record = _DeliveryRecord(seq, payload)
+                    ledger._records[seq] = record
+                    ledger._highest = seq
+
+        if action == "busy":
+            work_slots.release()
+            send_error(request_id, b"server busy")
+            return
+        if reply_submission(request_id, action, record):
+            work_slots.release()
+            return
+
+        try:
+            pool.submit(run_delivery, record, request_id)
+        except RuntimeError:
+            work_slots.release()
+            with ledger._cond:
+                if ledger._records.get(seq) is record and not record.done:
+                    del ledger._records[seq]
+                    if ledger._highest == seq:
+                        ledger._highest = previous_highest
+            send_error(request_id, b"server busy")
+
+    def handle_delivery_confirm(request_id, body):
+        if ledger is None:
+            send_error(request_id, b"delivery unavailable")
+            return
+        seq = _SEQ.unpack_from(body)[0]
+
+        with ledger._cond:
+            if seq > ledger._highest:
+                action = "unknown"
+            else:
+                record = ledger._records.get(seq)
+                if record is not None and not record.done:
+                    action = "pending"
+                else:
+                    # Confirmed or never-admitted-but-skipped sequences are
+                    # idempotently already settled.
+                    ledger._records.pop(seq, None)
+                    action = "ok"
+
+        if action == "unknown":
+            send_error(request_id, b"delivery unknown")
+        elif action == "pending":
+            send_error(request_id, b"delivery pending")
+        else:
+            send_result(request_id, b"")
 
     def wait_for_worker(stream, *, skip_if_cancelled):
         # Time-bounded acquisition lets a stream which never started user code
@@ -614,7 +917,7 @@ def serve(
                         break
                     kind, request_id, body = frame
 
-                    if kind in (REQUEST, STREAM_OPEN):
+                    if kind in (REQUEST, STREAM_OPEN, DELIVERY_SUBMIT, DELIVERY_CONFIRM):
                         if request_id <= last_id:
                             raise ProtocolError("expected increasing request ids")
                         last_id = request_id
@@ -628,6 +931,12 @@ def serve(
                                 raise
                         else:
                             write_frame(ERROR, request_id, b"server busy")
+
+                    elif kind == DELIVERY_SUBMIT:
+                        handle_delivery_submit(request_id, body)
+
+                    elif kind == DELIVERY_CONFIRM:
+                        handle_delivery_confirm(request_id, body)
 
                     elif kind == STREAM_OPEN:
                         if len(body) < 1:
@@ -694,9 +1003,31 @@ def serve(
                 for stream in active:
                     stream.cancel()
 
+                # A parked delivery claim must never leave a permanent wait
+                # slot behind once its connection is leaving.  It gives up
+                # its claim immediately; the owning instruction keeps running.
+                with delivery_waiters_lock:
+                    waiters = list(delivery_waiters)
+                for waiter in waiters:
+                    waiter.abandoned = True
+                    with ledger._cond:
+                        if waiter.record.waiter is waiter:
+                            waiter.record.waiter = None
+                    waiter.event.set()
+
         # Pool worker calls have finished here.  Wait for stream user code and
         # iterator cleanup to exit so serve does not outlive those callbacks.
         with threads_lock:
             threads = list(runner_threads)
         for thread in threads:
             thread.join()
+
+        for waiter in waiters:
+            thread = waiter.thread
+            if thread is not None and thread is not current_thread():
+                try:
+                    thread.join()
+                except RuntimeError:
+                    # The waiter was registered but its thread had not started
+                    # yet; it observes *abandoned* as soon as it does.
+                    pass
