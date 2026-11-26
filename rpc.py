@@ -25,6 +25,10 @@ from wire import (
     MAX_WINDOW,
     REQUEST,
     RESULT,
+    SCOPED_MAX_KEY_SIZE,
+    SCOPED_MAX_KEYS,
+    SCOPED_MAX_PAYLOAD,
+    SCOPED_REQUEST,
     STREAM_CANCEL,
     STREAM_CREDIT,
     STREAM_DATA,
@@ -69,6 +73,83 @@ def _payload(payload):
 
 def _delivery_seq(seq):
     return type(seq) is int and 1 <= seq < (1 << 64)
+
+
+def _scoped_key(key):
+    if not isinstance(key, str) or not 1 <= len(key) <= SCOPED_MAX_KEY_SIZE:
+        return False
+    for char in key:
+        if not (
+            "a" <= char <= "z"
+            or "A" <= char <= "Z"
+            or "0" <= char <= "9"
+            or char in "._-"
+        ):
+            return False
+    return True
+
+
+def _scoped_scope(shared, exclusive):
+    if type(shared) is not tuple or type(exclusive) is not tuple:
+        raise ValueError("shared and exclusive must be tuples of keys")
+    combined = shared + exclusive
+    if not all(_scoped_key(key) for key in combined):
+        raise ValueError(
+            "keys must be ASCII strings of 1 to 32 letters, digits, dots, "
+            "underscores or hyphens"
+        )
+    total = len(combined)
+    if not 1 <= total <= SCOPED_MAX_KEYS:
+        raise ValueError(
+            f"declare 1 to {SCOPED_MAX_KEYS} keys in total"
+        )
+    if len(set(shared) | set(exclusive)) != total:
+        raise ValueError("resource keys must not repeat")
+    return shared, exclusive
+
+
+def _encode_scoped_body(shared, exclusive, payload):
+    chunks = [bytes((len(shared), len(exclusive)))]
+    for key in shared + exclusive:
+        encoded = key.encode("ascii")
+        chunks.append(bytes((len(encoded),)))
+        chunks.append(encoded)
+    chunks.append(payload)
+    return b"".join(chunks)
+
+
+def _parse_scoped_body(body):
+    """Decode a SCOPED_REQUEST body or raise ProtocolError."""
+    if len(body) < 4:
+        raise ProtocolError("invalid scoped request frame")
+    shared_count, exclusive_count = body[0], body[1]
+    total = shared_count + exclusive_count
+    if not 1 <= total <= SCOPED_MAX_KEYS:
+        raise ProtocolError("invalid scoped request frame")
+    offset = 2
+    keys = []
+    for _ in range(total):
+        if offset >= len(body):
+            raise ProtocolError("invalid scoped request frame")
+        size = body[offset]
+        offset += 1
+        if size < 1 or offset + size > len(body):
+            raise ProtocolError("invalid scoped request frame")
+        raw = body[offset : offset + size]
+        offset += size
+        try:
+            key = raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise ProtocolError("invalid scoped request frame")
+        if not _scoped_key(key):
+            raise ProtocolError("invalid scoped request frame")
+        keys.append(key)
+    if len(set(keys)) != total:
+        raise ProtocolError("invalid scoped request frame")
+    payload = body[offset:]
+    if not isinstance(payload, bytes) or len(payload) > SCOPED_MAX_PAYLOAD:
+        raise ProtocolError("invalid scoped request frame")
+    return tuple(keys[:shared_count]), tuple(keys[shared_count:]), payload
 
 
 class DeliveryLedger:
@@ -306,6 +387,20 @@ class Client:
         if not _payload(payload):
             raise ValueError("expected up to 65536 bytes")
         return self._submit_frame(REQUEST, b"", payload)
+
+    def submit_scoped(self, payload, *, shared=(), exclusive=()):
+        """Submit one resource-scoped call, sharing this connection's limits.
+
+        Local validation happens before any request id or max_pending slot is
+        taken, so rejected arguments send no frame and leave no trace.
+        """
+        if not isinstance(payload, bytes) or len(payload) > SCOPED_MAX_PAYLOAD:
+            raise ValueError(
+                f"expected up to {SCOPED_MAX_PAYLOAD} bytes"
+            )
+        shared, exclusive = _scoped_scope(shared, exclusive)
+        body = _encode_scoped_body(shared, exclusive, payload)
+        return self._submit_frame(SCOPED_REQUEST, b"", body)
 
     def submit_delivery(self, seq, payload):
         """Submit a ledger-backed instruction under business sequence *seq*."""
@@ -619,6 +714,253 @@ class HandlerRollout:
                     self._lock.notify_all()
 
 
+# Shared declarations may run alongside each other; any exclusive claim on a
+# key excludes every other claim on that same key.
+_SCOPED_SHARED = "shared"
+_SCOPED_EXCLUSIVE = "exclusive"
+
+
+class _ScopedCall:
+    """One gate-admitted call, from admission until its callback exits."""
+
+    __slots__ = (
+        "seq",
+        "conn",
+        "request_id",
+        "payload",
+        "keys",
+        "modes",
+        "running",
+    )
+
+    def __init__(self, seq, conn, request_id, shared, exclusive, payload):
+        self.seq = seq
+        self.conn = conn
+        self.request_id = request_id
+        self.payload = payload
+        self.keys = tuple(shared) + tuple(exclusive)
+        self.modes = {key: _SCOPED_SHARED for key in shared}
+        self.modes.update({key: _SCOPED_EXCLUSIVE for key in exclusive})
+        self.running = False
+
+    def conflicts_with(self, other):
+        for key in self.keys:
+            mode = other.modes.get(key)
+            if mode is None:
+                continue
+            if (
+                self.modes[key] == _SCOPED_EXCLUSIVE
+                or mode == _SCOPED_EXCLUSIVE
+            ):
+                return True
+        return False
+
+
+class ResourceGate:
+    """Process-local coordinator of resource-scoped callbacks.
+
+    A gate is shared by any number of concurrent ``serve`` connections through
+    the ``resource_gate`` keyword.  It serializes access per resource key while
+    letting unrelated work proceed: shared claims on one key run in parallel,
+    and any exclusive claim on a key excludes every other claim on that key.
+    The gate bounds only its own admitted calls (waiting plus running); each
+    call still needs one of its own connection's existing worker permits
+    before it starts, and waiting never holds a permit or a partial key set.
+
+    Arbitration walks the queue in gate admission order and starts every call
+    whose whole key set is compatible with the currently running calls and
+    whose connection currently holds a free worker permit.  A key-blocked call
+    never seals its other, idle keys, so unrelated work always proceeds.  A
+    call blocked solely by its own connection's worker permits holds no keys
+    or permits; this implementation lets a later conflicting call that can
+    start immediately overtake it.  The full key set and the worker permit are
+    acquired together, so waiting never occupies a permit or partial keys.
+    """
+
+    def __init__(self, handler, *, capacity=16):
+        if not callable(handler):
+            raise ValueError("handler must be callable")
+        if type(capacity) is not int or not 1 <= capacity <= 64:
+            raise ValueError("capacity must be an integer from 1 to 64")
+        self._handler = handler
+        self._capacity = capacity
+        self._lock = Condition()
+        self._seq = 0
+        self._connections = {}
+        self._calls = deque()
+        self._arbiter = None
+
+    # ---- connection registration, used by serve ----
+
+    def attach(self, conn):
+        with self._lock:
+            starting = not self._connections
+            self._connections[conn.token] = conn
+            if starting:
+                # One arbiter per attached-connection epoch; it exits once the
+                # last connection detaches, so gates without users leave no
+                # background thread behind.
+                self._arbiter = Thread(
+                    target=self._arbitrate,
+                    name="rpc-resource-gate",
+                    daemon=True,
+                )
+                self._arbiter.start()
+            self._lock.notify_all()
+
+    def detach(self, conn):
+        """Forget a leaving connection and drop its still-queued calls.
+
+        Calls which already started keep their keys and run their callback to
+        completion; the connection simply cannot send their reply anymore.
+        """
+        with self._lock:
+            if self._connections.pop(conn.token, None) is None:
+                return
+            remaining = deque()
+            for call in self._calls:
+                if call.conn is conn and not call.running:
+                    continue
+                remaining.append(call)
+            self._calls = remaining
+            self._lock.notify_all()
+
+    # ---- admission, used by the serve accept loop ----
+
+    def admit(self, conn, request_id, shared, exclusive, payload):
+        """Register one scoped call; return False if the gate is full."""
+        with self._lock:
+            if len(self._calls) >= self._capacity:
+                return False
+            self._seq += 1
+            call = _ScopedCall(
+                self._seq, conn, request_id, shared, exclusive, payload
+            )
+            self._calls.append(call)
+            self._lock.notify_all()
+            return True
+
+    # ---- arbitration ----
+
+    def _blocked_by_running_locked(self, call):
+        """True if any running call conflicts with *call* on a shared key."""
+        for active in self._calls:
+            if active.running and call.conflicts_with(active):
+                return True
+        return False
+
+    def _scan_locked(self):
+        """Admit startable calls in gate order; return the chosen batch.
+
+        A call starts exactly when its whole key set is compatible with the
+        running set and its connection has a free worker permit.  Key-blocked
+        calls seal none of their idle keys, so later calls on those keys and
+        unrelated calls keep moving; a call blocked solely by its own
+        connection's permits holds nothing, so an eligible later call may
+        overtake it, as the arbitration policy explicitly permits.
+        """
+        started = []
+        for call in self._calls:
+            if call.running or not call.conn.alive:
+                continue
+            if self._blocked_by_running_locked(call):
+                continue
+            # Acquire the whole qualification atomically: the worker permit
+            # plus, effectively, every declared key (checked above).  Waiting
+            # calls never hold permits or partial resources.
+            if not call.conn.work_slots.acquire(blocking=False):
+                continue
+            call.running = True
+            started.append(call)
+        return started
+
+    def _launch(self, call):
+        try:
+            call.conn.pool.submit(self._run, call)
+        except RuntimeError:
+            # serve is shutting its pool down; release what the scan took and
+            # let the connection teardown settle the request.
+            with self._lock:
+                call.running = False
+                self._calls = deque(
+                    item for item in self._calls if item is not call
+                )
+                self._lock.notify_all()
+            call.conn.work_slots.release()
+
+    def _run(self, call):
+        conn = call.conn
+        try:
+            try:
+                response = self._handler(call.payload)
+                if not _payload(response):
+                    raise ValueError("invalid handler response")
+                kind, body = RESULT, response
+            except Exception:
+                kind, body = ERROR, b"handler failed"
+            try:
+                conn.write_frame(kind, call.request_id, body)
+            except OSError:
+                conn.terminate()
+        finally:
+            # Gate accounting and keys are released when the callback exits,
+            # independently of whether the peer ever reads the reply.
+            with self._lock:
+                self._calls = deque(
+                    item for item in self._calls if item is not call
+                )
+                self._lock.notify_all()
+            conn.work_slots.release()
+
+    def _reap_dead_locked(self):
+        dead = [
+            token
+            for token, conn in self._connections.items()
+            if not conn.alive
+        ]
+        for token in dead:
+            self._connections.pop(token, None)
+        if dead:
+            self._calls = deque(
+                call
+                for call in self._calls
+                if call.conn.alive or call.running
+            )
+
+    def _arbitrate(self):
+        while True:
+            with self._lock:
+                self._reap_dead_locked()
+                if not self._connections and not self._calls:
+                    # The last connection left and every callback it owned has
+                    # exited; this epoch is over until a new attach().
+                    self._arbiter = None
+                    return
+                started = self._scan_locked()
+                if not started:
+                    # Permits occupied by ordinary, stream or ledger work on a
+                    # connection are released outside the gate, so a periodic
+                    # re-check closes that window in bounded time.
+                    self._lock.wait(0.05)
+                    continue
+            for call in started:
+                self._launch(call)
+
+
+class _GateConnection:
+    """Per-connection facade handed to a shared ResourceGate."""
+
+    __slots__ = ("token", "work_slots", "pool", "write_frame", "terminate", "alive")
+
+    def __init__(self, token, work_slots, pool, write_frame, terminate):
+        self.token = token
+        self.work_slots = work_slots
+        self.pool = pool
+        self.write_frame = write_frame
+        self.terminate = terminate
+        self.alive = True
+
+
 def serve(
     sock,
     handler,
@@ -627,6 +969,7 @@ def serve(
     stream_slots=8,
     ledger=None,
     rollout=None,
+    resource_gate=None,
 ):
     """Own sock; answer ordinary calls, bounded streams, and deliveries.
 
@@ -641,6 +984,10 @@ def serve(
     :meth:`HandlerRollout.replace`; the positional *handler* then only backs
     ledger instructions, which never participate in rollout.  Passing both a
     rollout and a non-empty *stream_handler* raises ValueError.
+
+    When *resource_gate* is given, SCOPED_REQUEST frames are admitted to that
+    gate and run its own callback; they share this connection's worker
+    permits but never use the ordinary, stream or ledger callbacks.
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be positive")
@@ -659,6 +1006,10 @@ def serve(
         raise ValueError(
             "rollout supplies the stream handler; do not pass both"
         )
+    if resource_gate is not None and not isinstance(
+        resource_gate, ResourceGate
+    ):
+        raise ValueError("resource_gate must be a ResourceGate or None")
 
     writing = Lock()
     work_slots = BoundedSemaphore(workers)
@@ -670,6 +1021,7 @@ def serve(
     threads_lock = Lock()
     delivery_waiters = set()
     delivery_waiters_lock = Lock()
+    gate_attached = False
 
     def write_frame(kind, request_id, body=b""):
         with writing:
@@ -686,6 +1038,20 @@ def serve(
             write_frame(RESULT, request_id, body)
         except OSError:
             _terminate(sock)
+
+    def handle_scoped_request(request_id, body):
+        if resource_gate is None:
+            # Frame-by-frame rejection keeps the connection usable for every
+            # other frame kind.
+            send_error(request_id, b"resource scheduling unavailable")
+            return
+        # A malformed scoped frame is a protocol violation: the accept loop's
+        # outer handler terminates the connection just like any other bad frame.
+        shared, exclusive, payload = _parse_scoped_body(body)
+        if not resource_gate.admit(
+            gate_conn, request_id, shared, exclusive, payload
+        ):
+            send_error(request_id, b"resource queue full")
 
     def handle_request(request_id, body, generation=None):
         # When generation is given, the accept loop already holds one of its
@@ -1098,6 +1464,12 @@ def serve(
 
     with sock:
         with ThreadPoolExecutor(max_workers=workers) as pool:
+            gate_conn = _GateConnection(
+                object(), work_slots, pool, write_frame, lambda: _terminate(sock)
+            )
+            if resource_gate is not None:
+                resource_gate.attach(gate_conn)
+                gate_attached = True
             last_id = 0
             try:
                 while True:
@@ -1106,7 +1478,13 @@ def serve(
                         break
                     kind, request_id, body = frame
 
-                    if kind in (REQUEST, STREAM_OPEN, DELIVERY_SUBMIT, DELIVERY_CONFIRM):
+                    if kind in (
+                        REQUEST,
+                        STREAM_OPEN,
+                        DELIVERY_SUBMIT,
+                        DELIVERY_CONFIRM,
+                        SCOPED_REQUEST,
+                    ):
                         if request_id <= last_id:
                             raise ProtocolError("expected increasing request ids")
                         last_id = request_id
@@ -1143,6 +1521,9 @@ def serve(
 
                     elif kind == DELIVERY_CONFIRM:
                         handle_delivery_confirm(request_id, body)
+
+                    elif kind == SCOPED_REQUEST:
+                        handle_scoped_request(request_id, body)
 
                     elif kind == STREAM_OPEN:
                         if len(body) < 1:
@@ -1204,6 +1585,13 @@ def serve(
             finally:
                 _terminate(sock)
                 stopping.set()
+                # Release this connection's gate wait slots and priority at
+                # once.  Already-started scoped callbacks are pool work: the
+                # pool context below keeps running until each exits, and their
+                # keys stay held until then.
+                if gate_attached:
+                    gate_conn.alive = False
+                    resource_gate.detach(gate_conn)
                 with streams_lock:
                     active = list(streams.values())
                 for stream in active:

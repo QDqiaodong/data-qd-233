@@ -30,6 +30,9 @@ python3 demo.py
 `test_rollout_acceptance.py` 同样基于真实 `socketpair` 和事件门，覆盖不断线
 换版、断线与迭代器清理对卸载的门控、首次工厂执行与发布交错、卸载未结束时
 `Busy` 拒绝下一次发布，以及卸载异常经回执返回且不卡死后续发布。
+`test_resource_gate_acceptance.py` 用真实 `socketpair`、事件门和有界等待覆盖
+资源门：多键整组取得资格、执行位用尽时的跨连接仲裁（允许超车口径）、断线不丢弃
+正在执行的隔离、未启用 gate 的逐调用拒绝，以及非法参数不占用客户端名额。
 
 应输出 `reply order: FAST SLOW` 和 `isolated error: handler failed`。
 
@@ -257,6 +260,89 @@ receipt.result()          # 旧代 on_retire 安全执行完后以 None 完成
 `wait_closed()` 都收到 `PeerClosed`；服务端套接字停止后会唤醒并清理已停下
 的生产器。已经收到的普通结果或已经结算的流状态不因之后断线而改变。
 
+## 按资源集合调度的互斥调用（ResourceGate）
+
+多条长连接访问同一个设备配置服务时，普通 `submit()` 互不知情；需要跨连接
+协调的多段读取/更新改用 `Client.submit_scoped()`，并在服务端把这些连接挂到
+同一个 `ResourceGate` 上。资源键只是双方约定的 ASCII 名字，库不解析业务正文。
+
+```python
+from rpc import Client, ResourceGate, serve
+
+def config_handler(payload):          # 与普通处理函数同形：收 bytes、回 bytes
+    ...
+    return result
+
+gate = ResourceGate(config_handler, capacity=16)   # capacity 取 1..64 的整数
+
+# 同一进程内任意多个 serve 可以共享同一个 gate；不同 gate 之间互不协调。
+Thread(target=serve, args=(sock_1, ordinary_handler),
+       kwargs={"resource_gate": gate}).start()
+Thread(target=serve, args=(sock_2, ordinary_handler),
+       kwargs={"resource_gate": gate}).start()
+```
+
+```python
+future = client.submit_scoped(
+    payload,
+    shared=("section.b",),            # 共享声明：同键共享可并行
+    exclusive=("section.a",),         # 独占声明：同键任一方独占即互斥
+)
+result = future.result(timeout=2)
+```
+
+- 两组键都是 tuple，合计 1 至 8 个且互不重复；每个键是 1 至 32 个 ASCII
+  字符，只允许字母、数字、点、下划线和连字符，区分大小写。`payload` 是不超过
+  65000 字节的 `bytes`。任何非法本地参数立即抛 `ValueError`，不发送帧、不占用
+  请求 ID 或 `max_pending` 在途名额。
+- 每次提交都是一次独立操作：库不按正文或键合并调用，断线后也不自动重发。
+  返回的 future 与 `submit()` 一样不可取消，共用同一连接、请求 ID 序列和
+  `max_pending`。
+- 未启用 gate 的服务端对每次 scoped 调用单独回复
+  `RemoteError("resource scheduling unavailable")`，连接和其他帧类型不受影响。
+
+### 名额、执行位与回调归属
+
+- gate 的 `capacity` 跨所有挂接连接合计，统计“已接单且尚未退出回调”的调用数
+  （等待中的与运行中的都算）。接单时已满，该次立即得到
+  `RemoteError("resource queue full")`，不留队列项、不调用回调。接单成功后
+  暂时不能开始的调用保留原 future 排队等待，不会退回普通调用的
+  `server busy`。
+- scoped 回调由 **gate 自己的 handler** 提供，不改变普通、流、台账各自的回调
+  选择，也不参与 `HandlerRollout` 换版。它运行在该连接原有的线程池上，并与普通
+  处理、流的工厂/推进/清理、台账调用共同计入这条连接原有的 `workers` 执行位
+  上限，不另加并发配额。
+- 一个 scoped 调用只有在“整组键与正在运行的调用相容”且“本连接拿得到一个执行
+  位”时才开始，并且这两项资格在同一步内一次取得；等待期间不占执行位，也不会
+  只占住一组键的一半。共享声明之间同键可并行；同键只要任一方是独占就不能同时
+  执行。
+- 回调返回合法 bytes 即回复结果；回调抛异常或返回非法结果时该次得到
+  `RemoteError("handler failed")`。资源键和 gate 名额在回调退出时即释放，不等
+  客户端收取结果。
+
+### 仲裁口径（本实现的选择）
+
+规范允许两种口径，本库采用**允许超车**：
+
+- 仲裁按 gate 接单顺序扫描队列，启动所有“整组键与运行集合相容且本连接当前有
+  空闲执行位”的调用。
+- 因键冲突而等待的较早调用**不会封住自己声明的其他空闲键**：与它不冲突的调用
+  不会仅因排在它后面而停住。
+- 仅因本连接执行位用尽而等待的较早调用，手上没有键也没有执行位；此时一个能
+  立即满足条件的后到冲突调用可以先执行（超车）。较早调用一旦其连接释放执行位、
+  且键集合重新相容，就会在后续扫描中启动。
+- 在没有新增竞争、所需执行位与键已释放、对端仍在读帧、已开始的回调都会返回的
+  前提下，每个已接单调用都会继续推进直至结束，不会永久饥饿。
+
+### 断线时哪些工作仍会执行
+
+- 服务端发现某连接断开时，立即丢弃该连接**尚未取得执行资格**的排队项，释放其
+  gate 等待名额与任何排队位置；这些调用在客户端按既有 `PeerClosed` 契约结束。
+- **已经取得执行资格**的 scoped 操作会继续执行到回调退出，期间它声明的键不会
+  因连接消失而提前释放；只是回复帧无人接收。因此别的连接上同键的新调用仍须等
+  旧回调真正退出。
+- gate 不保留已结束调用的历史，无磁盘状态，也不提供进程重启后的恢复。
+
 ## 扩展帧类型
 
 旧的三种帧类型和线格式保持不变：
@@ -278,6 +364,7 @@ receipt.result()          # 旧代 on_retire 安全执行完后以 None 完成
 | `STREAM_CREDIT` | 8 | C→S | 空；`read()` 取走一块后归还一个窗口份额 |
 | `DELIVERY_SUBMIT` | 9 | C→S | 8 字节大端序列号后接最多 65528 字节正文；回复复用 `RESULT`/`ERROR` |
 | `DELIVERY_CONFIRM` | 10 | C→S | 恰好 8 字节大端序列号；回复复用 `RESULT`/`ERROR` |
+| `SCOPED_REQUEST` | 11 | C→S | 共享、独占计数各 1 字节，随后每个键为 1 字节长度加最多 32 字节 ASCII 名（先共享后独占，合计 1..8 个互不重复键），最后是最多 65000 字节正文；回复复用 `RESULT`/`ERROR` |
 
 没有远端自动重连或身份认证；处理函数和 future 回调由调用方信任，且必须
 能够返回。回调不要阻塞、同步等待其他 RPC 结果或再次提交 RPC。底层对端

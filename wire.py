@@ -11,9 +11,17 @@ STREAM_CANCEL, STREAM_CREDIT = 7, 8
 # by a payload, so the payload is at most 65528 bytes.  DELIVERY_CONFIRM's
 # body is exactly one 8-byte sequence.  Replies reuse RESULT/ERROR.
 DELIVERY_SUBMIT, DELIVERY_CONFIRM = 9, 10
+# Resource gate extension.  SCOPED_REQUEST's body is one shared-count byte and
+# one exclusive-count byte, then one length byte plus up to 32 ASCII bytes per
+# declared key (shared first, then exclusive), then the at most 65000-byte
+# payload.  Replies reuse RESULT/ERROR.
+SCOPED_REQUEST = 11
 DELIVERY_SEQ_SIZE = 8
 MAX_PAYLOAD = 65536
 DELIVERY_MAX_PAYLOAD = MAX_PAYLOAD - DELIVERY_SEQ_SIZE
+SCOPED_MAX_PAYLOAD = 65000
+SCOPED_MAX_KEYS = 8
+SCOPED_MAX_KEY_SIZE = 32
 MAX_CHUNK = MAX_PAYLOAD
 MAX_WINDOW = 16
 MAX_STREAM_SLOTS = 32
@@ -31,6 +39,7 @@ _FRAME_KINDS = frozenset(
         STREAM_CREDIT,
         DELIVERY_SUBMIT,
         DELIVERY_CONFIRM,
+        SCOPED_REQUEST,
     }
 )
 _EMPTY_BODY_KINDS = frozenset({STREAM_END, STREAM_CANCEL, STREAM_CREDIT})
@@ -73,6 +82,11 @@ def receive(sock):
     elif kind == DELIVERY_CONFIRM:
         if length != DELIVERY_SEQ_SIZE:
             raise ProtocolError("invalid delivery confirm frame")
+    elif kind == SCOPED_REQUEST:
+        # Two count bytes plus at least one key declaration; the detailed key
+        # and payload validation happens in rpc.py once the body is complete.
+        if length < 2 + 2 or length > MAX_PAYLOAD:
+            raise ProtocolError("invalid scoped request frame")
     elif length > MAX_PAYLOAD:
         raise ProtocolError("invalid frame header")
     return kind, request_id, read_exact(sock, length)
