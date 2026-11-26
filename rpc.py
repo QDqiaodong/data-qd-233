@@ -456,6 +456,9 @@ class _ServerStream:
         self.cancel_requested = False
         self.iterator = None
         self.close_attempted = False
+        # Generation owning this stream.  None until the first factory
+        # execution; from then until cleanup exit it never changes.
+        self.generation = None
 
     def cancel(self):
         with self.cond:
@@ -475,6 +478,147 @@ class _ServerStream:
             return self.cancel_requested
 
 
+def _rollout_callables(handler, stream_handler, on_retire):
+    return (
+        callable(handler)
+        and callable(stream_handler)
+        and callable(on_retire)
+    )
+
+
+class _Generation:
+    """One published handler/stream/retire triple with in-use accounting.
+
+    Work that may touch this generation's resources is represented by a pin:
+    an ordinary handler call pins for the duration of the call; a stream pins
+    from its first factory execution until its iterator cleanup has exited.
+    A generation may run its retirement callback only once retiring has been
+    published and its pin count reaches zero.
+    """
+
+    __slots__ = (
+        "handler",
+        "stream_handler",
+        "on_retire",
+        "_future",
+        "_cond",
+        "_active",
+        "_retiring",
+        "_retirement_started",
+    )
+
+    def __init__(self, handler, stream_handler, on_retire):
+        self.handler = handler
+        self.stream_handler = stream_handler
+        self.on_retire = on_retire
+        self._future = None
+        self._cond = Condition()
+        self._active = 0
+        self._retiring = False
+        self._retirement_started = False
+
+    def pin(self):
+        with self._cond:
+            self._active += 1
+
+    def unpin(self):
+        """Release one pin; return True if retirement may now start."""
+        with self._cond:
+            self._active -= 1
+            return self._retirement_ready_locked()
+
+    def begin_retirement(self, future):
+        """Mark this generation as replaced; return True if it is safe now."""
+        with self._cond:
+            self._retiring = True
+            self._future = future
+            return self._retirement_ready_locked()
+
+    def _retirement_ready_locked(self):
+        if self._retirement_started or not self._retiring or self._active != 0:
+            return False
+        self._retirement_started = True
+        return True
+
+
+class HandlerRollout:
+    """Process-local switchable supplier of ordinary and stream callbacks.
+
+    A rollout is shared by any number of concurrent ``serve`` connections.
+    Each :meth:`replace` publishes one new generation and returns a
+    :class:`~concurrent.futures.Future` receipt for the generation it replaced.
+    At most one generation may be waiting out retirement at a time, so a
+    second replacement before that receipt settles raises :class:`Busy`.
+    """
+
+    def __init__(self, handler, stream_handler, *, on_retire):
+        if not _rollout_callables(handler, stream_handler, on_retire):
+            raise ValueError(
+                "handler, stream_handler and on_retire must be callable"
+            )
+        self._lock = Condition()
+        self._current = _Generation(handler, stream_handler, on_retire)
+        self._retiring = None
+
+    def current(self):
+        with self._lock:
+            return self._current
+
+    def pin(self, generation):
+        generation.pin()
+
+    def release(self, generation):
+        if generation.unpin():
+            self._spawn_retirement(generation)
+
+    def replace(self, handler, stream_handler, *, on_retire):
+        if not _rollout_callables(handler, stream_handler, on_retire):
+            raise ValueError(
+                "handler, stream_handler and on_retire must be callable"
+            )
+        # The receipt is born running so it can never be cancelled.
+        future = Future()
+        future.set_running_or_notify_cancel()
+
+        with self._lock:
+            if self._retiring is not None:
+                raise Busy("previous generation has not finished retiring")
+            old = self._current
+            new = _Generation(handler, stream_handler, on_retire)
+            self._current = new
+            self._retiring = old
+            ready = old.begin_retirement(future)
+
+        if ready:
+            self._spawn_retirement(old)
+        return future
+
+    def _spawn_retirement(self, generation):
+        # Retirement runs on its own thread and never occupies a connection's
+        # execution permit.  The condition flag guarantees a single starter.
+        thread = Thread(
+            target=self._run_retirement,
+            args=(generation,),
+            name="rpc-rollout-retire",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_retirement(self, generation):
+        future = generation._future
+        try:
+            generation.on_retire()
+        except Exception as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
+        finally:
+            with self._lock:
+                if self._retiring is generation:
+                    self._retiring = None
+                    self._lock.notify_all()
+
+
 def serve(
     sock,
     handler,
@@ -482,6 +626,7 @@ def serve(
     stream_handler=None,
     stream_slots=8,
     ledger=None,
+    rollout=None,
 ):
     """Own sock; answer ordinary calls, bounded streams, and deliveries.
 
@@ -490,6 +635,12 @@ def serve(
     including streams paused solely because their reader is slow.  When a
     DeliveryLedger is supplied, delivery submissions use that ledger and the
     same ordinary handler; the ledger survives this connection.
+
+    When *rollout* is given it supplies the ordinary and stream callbacks for
+    this connection and may be replaced concurrently via
+    :meth:`HandlerRollout.replace`; the positional *handler* then only backs
+    ledger instructions, which never participate in rollout.  Passing both a
+    rollout and a non-empty *stream_handler* raises ValueError.
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be positive")
@@ -502,6 +653,12 @@ def serve(
         )
     if ledger is not None and not isinstance(ledger, DeliveryLedger):
         raise ValueError("ledger must be a DeliveryLedger or None")
+    if rollout is not None and not isinstance(rollout, HandlerRollout):
+        raise ValueError("rollout must be a HandlerRollout or None")
+    if rollout is not None and stream_handler is not None:
+        raise ValueError(
+            "rollout supplies the stream handler; do not pass both"
+        )
 
     writing = Lock()
     work_slots = BoundedSemaphore(workers)
@@ -530,10 +687,16 @@ def serve(
         except OSError:
             _terminate(sock)
 
-    def handle_request(request_id, body):
+    def handle_request(request_id, body, generation=None):
+        # When generation is given, the accept loop already holds one of its
+        # pins for this admitted call; it covers both pool queueing and the
+        # user call and is released exactly once here.
         try:
             try:
-                response = handler(body)
+                if generation is not None:
+                    response = generation.handler(body)
+                else:
+                    response = handler(body)
                 if not _payload(response):
                     raise ValueError("invalid handler response")
                 kind = RESULT
@@ -543,6 +706,8 @@ def serve(
         except OSError:
             _terminate(sock)
         finally:
+            if generation is not None:
+                rollout.release(generation)
             work_slots.release()
 
     # ---- delivery ledger integration ----
@@ -802,7 +967,24 @@ def serve(
                     try:
                         if stopping.is_set() or stream.is_cancelled():
                             break
-                        iterator = stream_handler(stream.payload)
+                        if rollout is not None:
+                            # A stream still queued for its first execution
+                            # picks up the generation now in force.  Pinning
+                            # here binds every later step and the cleanup to
+                            # that single generation until this runner exits.
+                            generation = rollout.current()
+                            rollout.pin(generation)
+                            stream.generation = generation
+                            try:
+                                iterator = generation.stream_handler(
+                                    stream.payload
+                                )
+                            except BaseException:
+                                rollout.release(generation)
+                                stream.generation = None
+                                raise
+                        else:
+                            iterator = stream_handler(stream.payload)
                         if not hasattr(iterator, "__next__"):
                             raise TypeError("stream_handler must return an iterator")
                         stream.iterator = iterator
@@ -890,6 +1072,13 @@ def serve(
                         work_slots.release()
                         permit_held = False
 
+            generation = stream.generation
+            if generation is not None:
+                # Cleanup has exited and no further factory, step or cleanup
+                # of this generation can be entered from this stream.
+                rollout.release(generation)
+                stream.generation = None
+
             with streams_lock:
                 streams.pop(request_id, None)
             admitted_streams.release()
@@ -924,9 +1113,26 @@ def serve(
 
                     if kind == REQUEST:
                         if work_slots.acquire(blocking=False):
+                            # Snapshot and pin the generation while admitting
+                            # the call: overload rejection is not admission,
+                            # and an admitted ordinary call (even one still
+                            # queued for a pool thread) finishes on its
+                            # accepted generation even if replaced meanwhile.
+                            generation = (
+                                rollout.current() if rollout is not None else None
+                            )
+                            if generation is not None:
+                                rollout.pin(generation)
                             try:
-                                pool.submit(handle_request, request_id, body)
+                                pool.submit(
+                                    handle_request,
+                                    request_id,
+                                    body,
+                                    generation,
+                                )
                             except RuntimeError:
+                                if generation is not None:
+                                    rollout.release(generation)
                                 work_slots.release()
                                 raise
                         else:
@@ -946,7 +1152,7 @@ def serve(
                         if not 1 <= window <= MAX_WINDOW or not _payload(payload):
                             raise ProtocolError("invalid stream open frame")
 
-                        if stream_handler is None:
+                        if stream_handler is None and rollout is None:
                             write_frame(
                                 ERROR, request_id, b"streaming unavailable"
                             )

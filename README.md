@@ -27,6 +27,9 @@ python3 demo.py
 窗口上限、未配置流处理器和断线清理。`test_delivery_acceptance.py` 用真实
 `socketpair` 和事件门覆盖补领台账：断线后换连接补领、容量/执行位门控、
 冲突与待完成、失败终态和未启用台账时的拒绝。
+`test_rollout_acceptance.py` 同样基于真实 `socketpair` 和事件门，覆盖不断线
+换版、断线与迭代器清理对卸载的门控、首次工厂执行与发布交错、卸载未结束时
+`Busy` 拒绝下一次发布，以及卸载异常经回执返回且不卡死后续发布。
 
 应输出 `reply order: FAST SLOW` 和 `isolated error: handler failed`。
 
@@ -168,6 +171,58 @@ client.confirm_delivery(seq).result(2)          # 确认收讫，释放名额
 进程重启后 `DeliveryLedger` 为空，服务端无法识别重启前已执行的编号，因此
 不提供跨重启的去重保证；它也不做磁盘恢复、自动重连或自动重试——重连和
 补领由生产者主动完成。
+
+## 不断线换版与安全卸载（HandlerRollout）
+
+同一进程的多条长连接可以共享一个 `HandlerRollout`，在客户不重连的情况下把
+普通查询处理函数和流工厂作为一代组件整体换成新版，并由库保证旧组件在仍有
+代码可能访问其资源时不会被卸载。
+
+```python
+from rpc import HandlerRollout, serve
+
+rollout = HandlerRollout(handler_a, stream_a, on_retire=release_resources_a)
+
+# rollout 可传给任意多条同时存在的连接；位置参数 handler 仍只服务台账指令。
+Thread(target=serve, args=(sock_1, ledger_handler),
+       kwargs={"rollout": rollout}).start()
+Thread(target=serve, args=(sock_2, ledger_handler),
+       kwargs={"rollout": rollout}).start()
+
+# 管理线程发布新一代，并拿到被换下那一代的卸载回执 Future。
+receipt = rollout.replace(handler_b, stream_b, on_retire=release_resources_b)
+receipt.result()          # 旧代 on_retire 安全执行完后以 None 完成
+```
+
+- `HandlerRollout(handler, stream_handler, *, on_retire)` 与 `replace(...)` 的
+  三个回调都必须可调用，否则抛 `ValueError` 且不改变现状。`serve(..., rollout=...)`
+  由 rollout 提供普通查询与流工厂，因此不能再同时传非空的旧 `stream_handler`，
+  否则启动时抛 `ValueError`；不传 `rollout` 的旧调用方式完全不变。
+- `replace(...)` 把两类回调作为一代一起发布，立即返回代表**被换下那一代**的
+  `concurrent.futures.Future`，该回执不可取消。发布不等待任何旧回调、连接退出
+  或卸载完成；发布之后在任一既有或新连接上才接纳的普通查询与流都使用新代
+  （再次换版则以换版次序为准）。已经接纳的普通查询始终由接纳时那一代处理。
+  过载得到的 `server busy` 不是接纳，不钉住任何一代。
+- **等待首次执行的流**：流在 `STREAM_OPEN` 接纳时只占流槽、不绑定组件；到它
+  第一次真正获得执行位、调用工厂的时刻，才绑定当时有效的那一代。因此换版前
+  已接纳但一直排队、没有运行过工厂的流，可能在换版后由新代工厂创建。规范允许
+  在“接纳时”或“获得首次执行机会时”的有效组件中二选一，本库采用后者。无论选
+  哪一代，一个流只调用一次工厂，从工厂开始到迭代器清理退出都钉在同一代，换版
+  既不取消它也不重开它；排队本身不会被当成失败。
+- **卸载口径**：旧代只有在再也不会进入它的任何普通处理函数、流工厂、推进或
+  迭代器清理，且已经进入的这些工作全部退出后，才在 rollout 自有的守护线程上
+  主动调用一次它的 `on_retire()`。卸载不占用各连接原有的 `workers` 执行位，
+  也不要求客户重连、新代工作停止或管理线程再发命令；客户端放弃、连接断开或
+  某一时刻没有代码在运行都不能单独作为可卸载凭据——例如暂停的流之后还能推进，
+  断线流的迭代器可能仍在清理。回调正常返回后回执以 `None` 完成；回调抛异常时
+  异常交给该回执，不回滚已发布的新版、不重试卸载，且该代代码不会再被调度。
+- **并发换版**：每个 rollout 至多有一个已换下、尚未结束卸载的版本。上一份卸载
+  回执未完成时再次（包括并发）调用 `replace` 立即抛 `rpc.Busy`，不改动当前
+  版本、不排队，也不会调用失败提案中的任何回调。旧代卸载结束（即使因异常结束）
+  后即可再次换版。库不保留已卸载组件的历史；业务调用与流仍沿用既有的执行位、
+  流槽和窗口限制。
+- 台账（`DeliveryLedger`）及补领行为不参与换版：台账指令始终使用 `serve`
+  位置参数上的处理函数，rollout 不影响台账语义、线上帧或客户端。
 
 ## 执行位、窗口和名额
 
