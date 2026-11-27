@@ -33,8 +33,81 @@ python3 demo.py
 `test_resource_gate_acceptance.py` 用真实 `socketpair`、事件门和有界等待覆盖
 资源门：多键整组取得资格、执行位用尽时的跨连接仲裁（允许超车口径）、断线不丢弃
 正在执行的隔离、未启用 gate 的逐调用拒绝，以及非法参数不占用客户端名额。
+`test_shared_reads_acceptance.py` 同样用真实 `socketpair`、事件门和有界等待覆盖
+同正文只读查询的物理读取合并：加入者绕过两项额度、每笔独立超时、最后等待者
+离开后的口径、断线只撤销本连接成员、reader 失败/非法返回、未配置服务与本地
+参数校验，并实际打印回调次数与超时观测。
 
 应输出 `reply order: FAST SLOW` 和 `isolated error: handler failed`。
+
+## 同正文只读查询合并（SharedReads）
+
+多个监控组件经不同的本地长连接同时查询同一设备时，一次物理读取可以回答正文
+完全相同的查询；但每个组件有自己的等待期限，一个组件等不及不能替别人放弃结果。
+把这些连接挂到同一个 `SharedReads` 上即可：
+
+```python
+from rpc import Client, SharedReads, serve
+
+def reader(payload, stop_event):        # 只读操作，返回至多 65536 字节 bytes
+    return device.read(payload)
+
+reads = SharedReads(reader, capacity=16)      # capacity 取 1..64 的整数
+
+# 同一进程任意多个 serve 可共享同一个 reads；不同实例之间互不合并。
+Thread(target=serve, args=(sock_1, handler),
+       kwargs={"shared_reads": reads}).start()
+Thread(target=serve, args=(sock_2, handler),
+       kwargs={"shared_reads": reads}).start()
+```
+
+```python
+future = client.submit_read(payload, wait_ms=2000)   # 与 submit() 一样不可取消
+result = future.result(timeout=3)
+```
+
+- `payload` 是最多 65534 字节的 `bytes`（可为空），`wait_ms` 是 1 至 60000 的
+  整数（不含 `bool`）。非法本地参数立即抛 `ValueError`，不发送帧、不占用请求 ID
+  或 `max_pending` 在途名额。返回值与错误沿用普通调用的 `RESULT`/`ERROR` 契约。
+- 只在同一个 `SharedReads` 内按正文 **bytes 完全相等** 合并；连接、等待期限和
+  传输请求 ID 都不参与正文比较。未配置 `shared_reads` 的服务端对每次调用只回
+  `RemoteError("shared reads unavailable")`，连接保持可用。
+- 帧为新类型 `SHARED_READ`（见下表），旧调用方式与线格式不变。
+
+### 一次物理读取，多个独立调用
+
+- 服务端处理新请求时，若有正文相同的读取正在进行，就**加入**它：加入者既不需要
+  全局读取额度，也不需要本连接的空闲执行位，只等结果，不再调用 reader。
+- 否则只有**同时**满足“全局还有一个读取额度（`capacity`）”与“接单连接还有一个
+  原有 `workers` 执行位”才开始新的物理读取；任一不满足立即
+  `RemoteError("shared read busy")`，不排队、不调用 reader。
+- 每份正文同时最多一个尚未退出的 reader。物理读取从开始到回调**实际退出**都占着
+  上述两项额度；它不会因接单连接断开而挪用另一个连接的执行位。只读请求与普通
+  请求、流、台账共同竞争同一条连接原有的执行位。
+- 每笔请求的等待期限从服务端开始处理本请求起按单调时钟单独计算。到期只让这一笔
+  收到 `RemoteError("shared read timed out")`，不必等 reader 返回；若读取在
+  期限上或之后才决定完成，也不再覆盖该超时，即使超时回复尚未写出。回调抛异常或
+  返回非法值时，仅向仍有资格的成员回 `RemoteError("handler failed")`。每笔请求至多
+  一个终态。
+- 服务端发现连接断开时立即撤掉该连接的成员，其客户端未完成请求按既有契约得到
+  `PeerClosed`；别的连接上仍有效的成员继续等同一次读取。
+- 已退出的物理读取**不**充当缓存，不为之后的请求保留历史。
+
+### 最后等待者离开后的口径（本实现的选择）
+
+规范允许两种口径，本库采用**允许重新加入**：
+
+- 当因超时或断线不再有有效成员时，让 reader 继续运行、**不设置**停止信号；它尚未
+  完成时，新到的同正文调用仍可加入并领取这次结果（即使当初只有它一个人等）。
+- 只要还有有效成员，就不会因其他成员离开而触发任何停读动作。
+- reader 实际退出后该次读取即结束，后来的同正文请求会开始一次全新的物理读取；
+  不保留结果作为缓存。
+
+若改用“停止接受加入”口径，则应请求 reader 停止，且在它实际退出前同正文请求收到
+`shared read busy`，退出后才能发起新读取——本库**不**采用该口径，同一 `SharedReads`
+实例始终使用上面的允许重新加入策略。
+
+## 扩展帧类型
 
 ## 普通调用
 
@@ -365,6 +438,7 @@ result = future.result(timeout=2)
 | `DELIVERY_SUBMIT` | 9 | C→S | 8 字节大端序列号后接最多 65528 字节正文；回复复用 `RESULT`/`ERROR` |
 | `DELIVERY_CONFIRM` | 10 | C→S | 恰好 8 字节大端序列号；回复复用 `RESULT`/`ERROR` |
 | `SCOPED_REQUEST` | 11 | C→S | 共享、独占计数各 1 字节，随后每个键为 1 字节长度加最多 32 字节 ASCII 名（先共享后独占，合计 1..8 个互不重复键），最后是最多 65000 字节正文；回复复用 `RESULT`/`ERROR` |
+| `SHARED_READ` | 12 | C→S | 2 字节大端等待毫秒数（1..60000），后接最多 65534 字节正文（可为空）；回复复用 `RESULT`/`ERROR` |
 
 没有远端自动重连或身份认证；处理函数和 future 回调由调用方信任，且必须
 能够返回。回调不要阻塞、同步等待其他 RPC 结果或再次提交 RPC。底层对端

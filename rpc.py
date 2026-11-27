@@ -29,6 +29,9 @@ from wire import (
     SCOPED_MAX_KEYS,
     SCOPED_MAX_PAYLOAD,
     SCOPED_REQUEST,
+    SHARED_READ,
+    SHARED_READ_MAX_PAYLOAD,
+    SHARED_READ_WAIT_SIZE,
     STREAM_CANCEL,
     STREAM_CREDIT,
     STREAM_DATA,
@@ -196,6 +199,7 @@ class _DeliveryWaiter:
 
 
 _SEQ = Struct(">Q")
+_WAIT = Struct(">H")
 
 
 class Stream:
@@ -410,6 +414,23 @@ class Client:
             raise ValueError("expected up to 65528 bytes")
         return self._submit_frame(
             DELIVERY_SUBMIT, _SEQ.pack(seq), payload
+        )
+
+    def submit_read(self, payload, *, wait_ms):
+        """Submit one shared read, coalesced by payload within a SharedReads.
+
+        *payload* is at most 65534 bytes (empty is allowed) and *wait_ms* is an
+        integer from 1 to 60000.  Invalid local arguments raise ValueError
+        before any frame is sent or any in-flight slot or request id is used.
+        """
+        if not isinstance(payload, bytes) or len(payload) > SHARED_READ_MAX_PAYLOAD:
+            raise ValueError(
+                f"expected up to {SHARED_READ_MAX_PAYLOAD} bytes"
+            )
+        if type(wait_ms) is not int or not 1 <= wait_ms <= 60000:
+            raise ValueError("wait_ms must be an integer from 1 to 60000")
+        return self._submit_frame(
+            SHARED_READ, _WAIT.pack(wait_ms), payload
         )
 
     def confirm_delivery(self, seq):
@@ -961,6 +982,323 @@ class _GateConnection:
         self.alive = True
 
 
+# ---- shared, coalesced device reads --------------------------------
+
+_SHARED_READ_TIMEOUT = b"shared read timed out"
+_SHARED_READ_FAILED = b"handler failed"
+
+
+class _SharedConnection:
+    """Per-connection facade handed to a shared SharedReads instance."""
+
+    __slots__ = (
+        "token",
+        "work_slots",
+        "pool",
+        "write_frame",
+        "terminate",
+        "alive",
+    )
+
+    def __init__(self, token, work_slots, pool, write_frame, terminate):
+        self.token = token
+        self.work_slots = work_slots
+        self.pool = pool
+        self.write_frame = write_frame
+        self.terminate = terminate
+        self.alive = True
+
+
+class _SharedMember:
+    """One client request waiting on a shared physical read."""
+
+    __slots__ = ("read", "conn", "request_id", "deadline", "state")
+
+    def __init__(self, read, conn, request_id, deadline):
+        self.read = read
+        self.conn = conn
+        self.request_id = request_id
+        self.deadline = deadline
+        # "waiting" until exactly one terminal reply has been decided.
+        self.state = "waiting"
+
+
+class _SharedRead:
+    """One physical reader call, shared by every joined request."""
+
+    __slots__ = ("payload", "owner", "stop_event", "members")
+
+    def __init__(self, payload, owner):
+        self.payload = payload
+        self.owner = owner
+        self.stop_event = Event()
+        self.members = set()
+
+
+class SharedReads:
+    """Process-local coalescer for identical read-only device queries.
+
+    One instance may be passed to any number of concurrent ``serve``
+    connections through the ``shared_reads`` keyword.  A request for a payload
+    with an in-progress reader joins that reader instead of starting another;
+    joining needs neither the global read slot nor a worker permit.  A new
+    physical read starts only when the global ``capacity`` has room *and* the
+    accepting connection has a free existing worker permit; otherwise the
+    request is rejected immediately with ``shared read busy``.
+
+    Each request has its own deadline, measured from when this server started
+    processing it.  The deadline only ends that member's wait: the reader is
+    never cancelled on its behalf and other members keep waiting.  When the
+    last member leaves, this implementation keeps the reader running and does
+    not set its stop event, so a later identical request may still join it and
+    receive its result.  A physical read that has exited is never retained as a
+    cache.
+    """
+
+    __slots__ = (
+        "_reader",
+        "_capacity",
+        "_lock",
+        "_reads",
+        "_conn_members",
+        "_timer",
+    )
+
+    def __init__(self, reader, *, capacity=16):
+        if not callable(reader):
+            raise ValueError("reader must be callable")
+        if type(capacity) is not int or not 1 <= capacity <= 64:
+            raise ValueError("capacity must be an integer from 1 to 64")
+        self._reader = reader
+        self._capacity = capacity
+        self._lock = Condition()
+        self._reads = {}
+        self._conn_members = {}
+        self._timer = None
+
+    # ---- accept loop integration ----
+
+    def accept(self, conn, request_id, payload, wait_ms):
+        """Register one read request; reply busy here when it cannot start."""
+        deadline = monotonic() + wait_ms / 1000.0
+        busy = False
+
+        with self._lock:
+            read = self._reads.get(payload)
+            if read is not None:
+                # Joining bypasses both quotas: an existing reader answers it.
+                self._add_member_locked(read, conn, request_id, deadline)
+            elif len(self._reads) >= self._capacity:
+                busy = True
+            elif not conn.work_slots.acquire(blocking=False):
+                busy = True
+            else:
+                read = _SharedRead(payload, conn)
+                self._reads[payload] = read
+                self._add_member_locked(read, conn, request_id, deadline)
+                try:
+                    conn.pool.submit(self._run, read)
+                except RuntimeError:
+                    # The accepting pool is shutting down; undo admission and
+                    # return the worker permit without queuing anything.
+                    read.members.clear()
+                    self._drop_conn_member_locked(conn, request_id)
+                    if self._reads.get(payload) is read:
+                        del self._reads[payload]
+                    conn.work_slots.release()
+                    busy = True
+            if not busy:
+                self._ensure_timer_locked()
+                self._lock.notify_all()
+
+        if busy:
+            self._reply(conn, ERROR, request_id, b"shared read busy")
+
+    def detach(self, conn):
+        """Forget every waiting member of a connection which has left.
+
+        Other connections' members keep waiting for the same physical read.
+        Under this implementation's last-member policy the reader keeps
+        running, so a later identical request may still join it.
+        """
+        with self._lock:
+            members = self._conn_members.pop(conn.token, None)
+            if members:
+                for member in list(members):
+                    if member.state == "waiting":
+                        member.state = "settled"
+                        member.read.members.discard(member)
+                self._lock.notify_all()
+
+    # ---- membership and reply bookkeeping ----
+
+    def _add_member_locked(self, read, conn, request_id, deadline):
+        member = _SharedMember(read, conn, request_id, deadline)
+        read.members.add(member)
+        self._conn_members.setdefault(conn.token, set()).add(member)
+        return member
+
+    def _drop_conn_member_locked(self, conn, request_id):
+        members = self._conn_members.get(conn.token)
+        if not members:
+            return
+        for member in list(members):
+            if member.request_id == request_id:
+                members.discard(member)
+                if not members:
+                    self._conn_members.pop(conn.token, None)
+                return
+
+    def _settle_locked(self, member, kind, body, replies):
+        """Decide the single terminal reply for a still-waiting member."""
+        if member.state != "waiting":
+            return
+        member.state = "settled"
+        member.read.members.discard(member)
+        bucket = self._conn_members.get(member.conn.token)
+        if bucket is not None:
+            bucket.discard(member)
+            if not bucket:
+                self._conn_members.pop(member.conn.token, None)
+        replies.append((member.conn, member.request_id, kind, body))
+
+    def _ensure_timer_locked(self):
+        if self._timer is None:
+            self._timer = Thread(
+                target=self._deadline_loop,
+                name="rpc-shared-read-deadlines",
+                daemon=True,
+            )
+            self._timer.start()
+
+    def _reply(self, conn, kind, request_id, body):
+        # A dedicated thread keeps one slow or blocked peer from delaying any
+        # other connection's replies or the accept loop.
+        try:
+            Thread(
+                target=self._deliver,
+                args=(conn, kind, request_id, body),
+                name="rpc-shared-read-reply",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            conn.terminate()
+
+    def _deliver(self, conn, kind, request_id, body):
+        try:
+            conn.write_frame(kind, request_id, body)
+        except OSError:
+            conn.terminate()
+
+    def _spawn_replies(self, replies):
+        for conn, request_id, kind, body in replies:
+            self._reply(conn, kind, request_id, body)
+
+    # ---- the physical reader ----
+
+    def _run(self, read):
+        kind, body = ERROR, _SHARED_READ_FAILED
+        try:
+            try:
+                value = self._reader(read.payload, read.stop_event)
+            except Exception:
+                pass
+            else:
+                if _payload(value):
+                    kind, body = RESULT, value
+
+            now = monotonic()
+            replies = []
+            with self._lock:
+                if self._reads.get(read.payload) is read:
+                    del self._reads[read.payload]
+                for member in list(read.members):
+                    if member.state != "waiting":
+                        continue
+                    if now < member.deadline:
+                        self._settle_locked(member, kind, body, replies)
+                    else:
+                        # A completion decided at or after the deadline never
+                        # overrides that member's timeout, even if the timeout
+                        # reply has not been written yet.
+                        self._settle_locked(
+                            member, ERROR, _SHARED_READ_TIMEOUT, replies
+                        )
+                self._lock.notify_all()
+            self._spawn_replies(replies)
+        finally:
+            # Both quotas stay held until the callback has actually exited.
+            # The global read slot is released by removing the entry above;
+            # this permit belongs to the connection which accepted the read.
+            read.owner.work_slots.release()
+
+    # ---- per-member deadlines ----
+
+    def _earliest_deadline_locked(self, now):
+        """Earliest deadline among waiting members, or None.
+
+        A member already due returns *now* so the caller re-scans at once.
+        """
+        earliest = None
+        for read in list(self._reads.values()):
+            for member in list(read.members):
+                if member.state != "waiting":
+                    continue
+                if member.deadline <= now:
+                    return now
+                if earliest is None or member.deadline < earliest:
+                    earliest = member.deadline
+        return earliest
+
+    def _deadline_loop(self):
+        while True:
+            replies = []
+            with self._lock:
+                if not self._reads:
+                    self._timer = None
+                    return
+                now = monotonic()
+                for read in list(self._reads.values()):
+                    for member in list(read.members):
+                        if (
+                            member.state == "waiting"
+                            and now >= member.deadline
+                        ):
+                            self._settle_locked(
+                                member,
+                                ERROR,
+                                _SHARED_READ_TIMEOUT,
+                                replies,
+                            )
+                still_running = bool(self._reads)
+
+            # Replies go out before this thread parks again; one slow or
+            # blocked peer cannot delay another member's timeout reply.
+            self._spawn_replies(replies)
+            if not still_running:
+                with self._lock:
+                    if not self._reads:
+                        self._timer = None
+                        return
+                    # A read appeared after the scan; keep owning the timer.
+                continue
+
+            with self._lock:
+                if not self._reads:
+                    self._timer = None
+                    return
+                # Recompute while holding the very lock we will wait on, so a
+                # member registered after the scan above cannot be missed.
+                now = monotonic()
+                earliest = self._earliest_deadline_locked(now)
+                if earliest is None:
+                    self._lock.wait()
+                elif earliest > now:
+                    self._lock.wait(earliest - now)
+                # Otherwise a member is already due: loop straight back.
+
+
+
 def serve(
     sock,
     handler,
@@ -970,6 +1308,7 @@ def serve(
     ledger=None,
     rollout=None,
     resource_gate=None,
+    shared_reads=None,
 ):
     """Own sock; answer ordinary calls, bounded streams, and deliveries.
 
@@ -988,6 +1327,10 @@ def serve(
     When *resource_gate* is given, SCOPED_REQUEST frames are admitted to that
     gate and run its own callback; they share this connection's worker
     permits but never use the ordinary, stream or ledger callbacks.
+
+    When *shared_reads* is given, SHARED_READ frames join its coalescing
+    readers; a joined request needs neither a worker permit nor a global read
+    slot, and each request keeps its own server-measured deadline.
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be positive")
@@ -1010,6 +1353,10 @@ def serve(
         resource_gate, ResourceGate
     ):
         raise ValueError("resource_gate must be a ResourceGate or None")
+    if shared_reads is not None and not isinstance(
+        shared_reads, SharedReads
+    ):
+        raise ValueError("shared_reads must be a SharedReads or None")
 
     writing = Lock()
     work_slots = BoundedSemaphore(workers)
@@ -1022,6 +1369,7 @@ def serve(
     delivery_waiters = set()
     delivery_waiters_lock = Lock()
     gate_attached = False
+    shared_attached = False
 
     def write_frame(kind, request_id, body=b""):
         with writing:
@@ -1052,6 +1400,23 @@ def serve(
             gate_conn, request_id, shared, exclusive, payload
         ):
             send_error(request_id, b"resource queue full")
+
+    def handle_shared_read(request_id, body):
+        # An unconfigured service rejects every syntactically framed read the
+        # same way, keeping the connection usable for other frame kinds.
+        if shared_reads is None:
+            send_error(request_id, b"shared reads unavailable")
+            return
+        # A malformed shared-read frame is a protocol violation; the payload
+        # length and wait range are the frame's own contract.
+        payload = body[SHARED_READ_WAIT_SIZE:]
+        wait_ms = _WAIT.unpack_from(body)[0]
+        if not 1 <= wait_ms <= 60000 or len(payload) > SHARED_READ_MAX_PAYLOAD:
+            raise ProtocolError("invalid shared read frame")
+        # Registration happens while the accept loop is still processing this
+        # frame; per-request deadlines start now, independently of any other
+        # member and of the reader's own runtime.
+        shared_reads.accept(shared_conn, request_id, payload, wait_ms)
 
     def handle_request(request_id, body, generation=None):
         # When generation is given, the accept loop already holds one of its
@@ -1467,9 +1832,14 @@ def serve(
             gate_conn = _GateConnection(
                 object(), work_slots, pool, write_frame, lambda: _terminate(sock)
             )
+            shared_conn = _SharedConnection(
+                object(), work_slots, pool, write_frame, lambda: _terminate(sock)
+            )
             if resource_gate is not None:
                 resource_gate.attach(gate_conn)
                 gate_attached = True
+            if shared_reads is not None:
+                shared_attached = True
             last_id = 0
             try:
                 while True:
@@ -1484,6 +1854,7 @@ def serve(
                         DELIVERY_SUBMIT,
                         DELIVERY_CONFIRM,
                         SCOPED_REQUEST,
+                        SHARED_READ,
                     ):
                         if request_id <= last_id:
                             raise ProtocolError("expected increasing request ids")
@@ -1524,6 +1895,9 @@ def serve(
 
                     elif kind == SCOPED_REQUEST:
                         handle_scoped_request(request_id, body)
+
+                    elif kind == SHARED_READ:
+                        handle_shared_read(request_id, body)
 
                     elif kind == STREAM_OPEN:
                         if len(body) < 1:
@@ -1592,6 +1966,13 @@ def serve(
                 if gate_attached:
                     gate_conn.alive = False
                     resource_gate.detach(gate_conn)
+                if shared_attached:
+                    shared_conn.alive = False
+                    # Withdraw this connection's waiting members.  The physical
+                    # reader keeps running and other connections' members keep
+                    # waiting for it; this connection's caller already follows
+                    # the ordinary PeerClosed contract.
+                    shared_reads.detach(shared_conn)
                 with streams_lock:
                     active = list(streams.values())
                 for stream in active:

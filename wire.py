@@ -16,9 +16,15 @@ DELIVERY_SUBMIT, DELIVERY_CONFIRM = 9, 10
 # declared key (shared first, then exclusive), then the at most 65000-byte
 # payload.  Replies reuse RESULT/ERROR.
 SCOPED_REQUEST = 11
+# Shared-read extension.  SHARED_READ's body is a 2-byte big-endian wait in
+# milliseconds followed by an at most 65534-byte payload (empty is allowed).
+# Replies reuse RESULT/ERROR.
+SHARED_READ = 12
 DELIVERY_SEQ_SIZE = 8
 MAX_PAYLOAD = 65536
 DELIVERY_MAX_PAYLOAD = MAX_PAYLOAD - DELIVERY_SEQ_SIZE
+SHARED_READ_WAIT_SIZE = 2
+SHARED_READ_MAX_PAYLOAD = MAX_PAYLOAD - SHARED_READ_WAIT_SIZE
 SCOPED_MAX_PAYLOAD = 65000
 SCOPED_MAX_KEYS = 8
 SCOPED_MAX_KEY_SIZE = 32
@@ -40,6 +46,7 @@ _FRAME_KINDS = frozenset(
         DELIVERY_SUBMIT,
         DELIVERY_CONFIRM,
         SCOPED_REQUEST,
+        SHARED_READ,
     }
 )
 _EMPTY_BODY_KINDS = frozenset({STREAM_END, STREAM_CANCEL, STREAM_CREDIT})
@@ -87,6 +94,11 @@ def receive(sock):
         # and payload validation happens in rpc.py once the body is complete.
         if length < 2 + 2 or length > MAX_PAYLOAD:
             raise ProtocolError("invalid scoped request frame")
+    elif kind == SHARED_READ:
+        # A 2-byte wait plus an optional body; the wait value and payload are
+        # validated in rpc.py once the body is complete.
+        if length < SHARED_READ_WAIT_SIZE or length > MAX_PAYLOAD:
+            raise ProtocolError("invalid shared read frame")
     elif length > MAX_PAYLOAD:
         raise ProtocolError("invalid frame header")
     return kind, request_id, read_exact(sock, length)
