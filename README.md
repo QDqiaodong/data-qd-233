@@ -37,6 +37,11 @@ python3 demo.py
 同正文只读查询的物理读取合并：加入者绕过两项额度、每笔独立超时、最后等待者
 离开后的口径、断线只撤销本连接成员、reader 失败/非法返回、未配置服务与本地
 参数校验，并实际打印回调次数与超时观测。
+`test_calibration_acceptance.py` 用真实 `socketpair`、事件门、有界等待和只观察
+不替代传输的套接字包装覆盖校准转换：槽位过载且设备卡住时普通状态查询仍可
+往返、待查正文的跨连接边界、断线收尾（PeerClosed、state 恰好清理一次、不
+commit、未开始的读取不执行）、每笔只用自己的查找值、设备失败隔离、空答复、
+未配置拒绝与构造/参数校验。
 
 应输出 `reply order: FAST SLOW` 和 `isolated error: handler failed`。
 
@@ -106,6 +111,101 @@ result = future.result(timeout=3)
 若改用“停止接受加入”口径，则应请求 reader 停止，且在它实际退出前同正文请求收到
 `shared read busy`，退出后才能发起新读取——本库**不**采用该口径，同一 `SharedReads`
 实例始终使用上面的允许重新加入策略。
+
+## 服务端反向查取设备校准数据（Calibration）
+
+采集端把转换请求发给服务端后，服务端读完采样头才知道需要哪份校准数据；这份数据
+只存在于采集端设备上，不能随每个请求全量上传。启用本扩展后，服务端在处理一笔
+转换时通过**同一条连接**向该次调用的发起方反向查一次设备数据，拿到合法答复后才
+提交转换结果。设备读取可以暂时卡住，期间同连接的普通状态查询照常往返。
+
+```python
+from rpc import Calibration, Client, serve
+
+def prepare(payload):
+    state = acquire_workspace(payload)       # state 是进程内业务对象，不上线
+    query = device_query_for(payload)         # 至多 32768 字节的 bytes
+    return state, query
+
+def commit(state, answer):                    # answer 为至多 32768 字节的 bytes
+    result = convert(state, answer)
+    return result                             # 沿用普通回复限制（<=65536 字节）
+
+def dispose(state):                           # 释放 prepare 取得的临时工作区
+    release_workspace(state)
+
+calibration = Calibration(prepare, commit, dispose)
+# calibration_slots 取 1..16 的非布尔整数
+Thread(target=serve, args=(sock, ordinary_handler),
+       kwargs={"calibration": calibration, "calibration_slots": 4}).start()
+```
+
+```python
+def calibration_reader(query):                # 调用方设备的读取回调
+    return device.read(query)                 # 至多 32768 字节；空 bytes 合法
+
+client = Client(sock, calibration_reader=calibration_reader)
+future = client.submit_calibrated(payload)    # 与 submit() 同样的输入限制
+result = future.result(timeout=5)
+```
+
+- `Client.submit_calibrated(payload)` 与 `submit()` 共用请求 ID 序列、
+  `max_pending` 在途名额和不可取消的 future；每次提交独立处理，正文相同也不
+  合并。非法参数立即抛 `ValueError`，不发帧、不占名额。不另开连接，只新增
+  校准专用帧；所有旧入口、旧帧和旧调用行为不变。
+- `calibration_reader(query) -> bytes` 可阻塞但最终会返回，在专用线程上执行，
+  绝不在解析普通回复的线程上同步等待，因此设备卡住时普通帧的收发不受影响。
+  每个 Client 至多有一个“已经开始、尚未退出”的设备读取；它不会因连接中断被
+  强行杀掉，`Client.close()` 也不等待它。查询与答复各自至多 32768 字节，空
+  bytes 是合法答复。
+- 服务端每条连接在接单到最终清理之间至多有 `calibration_slots` 笔转换；槽满时
+  只拒绝当前请求并回 `RemoteError("calibration busy")`，不运行其 prepare。未
+  配置服务端功能时回 `RemoteError("calibration unavailable")`。
+- `prepare`、`commit`、`dispose` 的每次执行都计入该连接原有的 `workers`
+  执行位，不增加业务执行位；等待执行位或等待调用端校准数据期间不占执行位，有
+  转换在等也不构成普通请求过载。
+- 错误口径：没有设备回调回 `calibration reader unavailable`；设备回调抛异常或
+  返回非法值回 `calibration read failed`；prepare 抛异常、返回格式非法、query
+  非法或 commit 失败/返回非法值回 `handler failed`。只有合法答复才会调用
+  commit。
+- prepare 合法返回后，这笔转换只使用对应的一个设备读取结果：不向其他连接查找、
+  不重跑 prepare、也不因设备正忙而多读一次。prepare 返回二元组但 query 非法时，
+  二元组里的 state 仍会被清理；没有返回二元组时库没有可清理的 state。
+- 取得 state 后，无论成功、拒绝、异常还是断线，`dispose(state)` 都**恰好一次**，
+  且不与该 state 的 commit 重叠；连接正常时库会等清理结束才回复并释放转换名额。
+  commit 一旦开始就允许其退出后再清理，断线后库**不承诺撤销**已经开始的 commit
+  的业务效果。
+
+### 查询正文何时交给对端（本实现的选择）
+
+调用端设备只有一条工作通道，不能让排队查询正文随服务端并发数增长。规范允许
+“提前交接”与“不提前交接”两种口径，本库采用**不提前交接**：
+
+- 一份完整查询正文只有在上一次设备读取的终态答复（`CALIB_ANSWER` 或两个空体
+  控制帧之一）已经回到服务端、设备通道空闲后，才会写入连接发往调用端；因此
+  任一时刻“已发出但尚未开始读取的完整查询正文”至多一份，稳态下实际上是零份
+  （新正文不会在旧读取结束前发出）。其他待查状态留在服务端，每个接单槽至多
+  保留一份待查正文，不保留已结束调用的历史；不带正文的控制信息不计入此上限。
+- 该上限完全由 accept 循环中的通道仲裁维护，**不靠阻塞普通帧的收发**实现：设备
+  读取在调用端的独立线程上进行，普通状态查询等帧随时可以双向往返。
+- 因为不提前交接，设备读取卡住期间，后续转换的查询正文根本不会跨过连接；此时
+  谁负责丢弃未开始的查询？——服务端在发现连接结束时清空自己的待查队列，这些
+  正文从未交给调用端，因此调用端无需丢弃任何东西；已发出的那一份对应一个
+  已经开始的读取，它可以在本地收尾，但其迟到结果不能恢复任何转换。
+- **如何不靠猜时序观察该边界**：在套接字外层包一个只记录 `sendall` 的观察器
+  （字节仍走真实 `socketpair`，见 `test_calibration_acceptance.py` 的
+  `RecordingSocket`），在设备门关闭、读取未退出的稳定区间内直接断言线上已出现的
+  `CALIB_QUERY` 帧数：本实现下恰好只有卡住的那一笔的正文跨过连接，其余槽位的
+  正文计数为 0；再用各请求自己的请求 ID 区分哪些正文跨过、哪些没跨过。
+
+### 断线语义
+
+- 任一端发现连接结束后，不再开始该连接尚未执行的设备读取，也不再开始新的
+  commit；原连接上未完成的 future 一律以 `PeerClosed` 结束。
+- 已经开始的设备读取允许在本地收尾，其迟到结果不能恢复任何转换。服务端自行
+  清理已取得的 state 并退出，不等远端设备退出，也不等一个无法送达的答复。
+- `Client.close()` 若遇到本地设备读取仍卡着，会立即返回，不等待该回调。
+- 本功能不提供自动重试、重连补领或跨连接存储。
 
 ## 扩展帧类型
 
@@ -439,6 +539,11 @@ result = future.result(timeout=2)
 | `DELIVERY_CONFIRM` | 10 | C→S | 恰好 8 字节大端序列号；回复复用 `RESULT`/`ERROR` |
 | `SCOPED_REQUEST` | 11 | C→S | 共享、独占计数各 1 字节，随后每个键为 1 字节长度加最多 32 字节 ASCII 名（先共享后独占，合计 1..8 个互不重复键），最后是最多 65000 字节正文；回复复用 `RESULT`/`ERROR` |
 | `SHARED_READ` | 12 | C→S | 2 字节大端等待毫秒数（1..60000），后接最多 65534 字节正文（可为空）；回复复用 `RESULT`/`ERROR` |
+| `CALIB_REQUEST` | 13 | C→S | 与普通请求同限的转换正文；终态回复复用 `RESULT`/`ERROR` |
+| `CALIB_QUERY` | 14 | S→C | 反向设备查询正文，最多 32768 字节（可为空），请求 ID 沿用原转换的 ID |
+| `CALIB_ANSWER` | 15 | C→S | 设备答复正文，最多 32768 字节（空 bytes 合法），请求 ID 与查询一致 |
+| `CALIB_NO_READER` | 16 | C→S | 空体控制帧：调用端未配置设备回调 |
+| `CALIB_READ_FAIL` | 17 | C→S | 空体控制帧：设备回调抛异常或返回非法值 |
 
 没有远端自动重连或身份认证；处理函数和 future 回调由调用方信任，且必须
 能够返回。回调不要阻塞、同步等待其他 RPC 结果或再次提交 RPC。底层对端

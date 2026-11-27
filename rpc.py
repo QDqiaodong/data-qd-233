@@ -15,6 +15,12 @@ from threading import (
 from time import monotonic
 
 from wire import (
+    CALIB_ANSWER,
+    CALIB_MAX_PAYLOAD,
+    CALIB_NO_READER,
+    CALIB_QUERY,
+    CALIB_READ_FAIL,
+    CALIB_REQUEST,
     DELIVERY_CONFIRM,
     DELIVERY_MAX_PAYLOAD,
     DELIVERY_SEQ_SIZE,
@@ -57,6 +63,14 @@ class RemoteError(RuntimeError):
 
 class StreamClosed(RuntimeError):
     pass
+
+
+# Remote error texts for the calibration extension.
+_CALIB_BUSY = b"calibration busy"
+_CALIB_UNAVAILABLE = b"calibration unavailable"
+_CALIB_READER_UNAVAILABLE = b"calibration reader unavailable"
+_CALIB_READ_FAILED = b"calibration read failed"
+_CALIB_HANDLER_FAILED = b"handler failed"
 
 
 def _terminate(sock):
@@ -354,16 +368,21 @@ StreamHandle = Stream
 
 
 class Client:
-    def __init__(self, sock, *, max_pending=16):
+    def __init__(self, sock, *, max_pending=16, calibration_reader=None):
         if type(max_pending) is not int or max_pending < 1:
             raise ValueError("max_pending must be positive")
+        if calibration_reader is not None and not callable(calibration_reader):
+            raise ValueError("calibration_reader must be callable or None")
         self._sock = sock
         self._limit = max_pending
+        self._calibration_reader = calibration_reader
         self._pending = {}
         self._numbers = count(1)
         self._lock = Lock()
         self._sending = Lock()
         self._closed = False
+        # At most one started, not-yet-exited device read per Client.
+        self._device_read_active = False
         self._reader = Thread(target=self._dispatch, name="rpc-reader", daemon=True)
         self._reader.start()
 
@@ -391,6 +410,19 @@ class Client:
         if not _payload(payload):
             raise ValueError("expected up to 65536 bytes")
         return self._submit_frame(REQUEST, b"", payload)
+
+    def submit_calibrated(self, payload):
+        """Submit one conversion that may trigger a device calibration read.
+
+        The frame shares ``submit``'s payload limit, request-id sequence and
+        ``max_pending`` accounting; its uncancellable future is settled by the
+        ordinary RESULT/ERROR contract.  Every submission is independent:
+        identical payloads are never coalesced.  Invalid arguments raise
+        ValueError before any frame is sent or any slot reserved.
+        """
+        if not _payload(payload):
+            raise ValueError("expected up to 65536 bytes")
+        return self._submit_frame(CALIB_REQUEST, b"", payload)
 
     def submit_scoped(self, payload, *, shared=(), exclusive=()):
         """Submit one resource-scoped call, sharing this connection's limits.
@@ -489,6 +521,71 @@ class Client:
         except OSError as exc:
             self._shutdown(exc)
 
+    # ---- server-driven calibration device reads ----
+
+    def _handle_calibration_query(self, request_id, query):
+        """Arrange one device read for an inbound CALIB_QUERY frame.
+
+        The read never runs on the dispatch thread itself: a dedicated daemon
+        thread runs the potentially blocking callback so ordinary reply frames
+        keep flowing.  At most one such read may be active at a time; a second
+        overlapping query is a protocol violation.  The callback cannot be
+        killed by a disconnect, and ``close()`` never joins its thread; a late
+        result on a closed connection is simply dropped.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            if self._device_read_active:
+                raise ProtocolError("overlapping calibration query")
+            self._device_read_active = True
+
+        if self._calibration_reader is None:
+            with self._lock:
+                self._device_read_active = False
+            self._send_control(CALIB_NO_READER, request_id)
+            return
+
+        try:
+            thread = Thread(
+                target=self._run_device_read,
+                args=(request_id, query),
+                name="rpc-calib-device",
+                daemon=True,
+            )
+            thread.start()
+        except RuntimeError as exc:
+            with self._lock:
+                self._device_read_active = False
+            self._shutdown(exc)
+
+    def _run_device_read(self, request_id, query):
+        kind = CALIB_ANSWER
+        body = b""
+        try:
+            try:
+                answer = self._calibration_reader(query)
+            except Exception:
+                kind = CALIB_READ_FAIL
+            else:
+                if not isinstance(answer, bytes) or len(answer) > CALIB_MAX_PAYLOAD:
+                    kind = CALIB_READ_FAIL
+                else:
+                    body = answer
+        finally:
+            with self._lock:
+                self._device_read_active = False
+                closed = self._closed
+        if closed:
+            # The connection ended while the device was stuck: the late result
+            # cannot revive any conversion and the socket is gone.
+            return
+        try:
+            with self._sending:
+                send(self._sock, kind, request_id, body)
+        except OSError as exc:
+            self._shutdown(exc)
+
     def _release_record(self, request_id, record):
         with self._lock:
             if self._pending.get(request_id) is record:
@@ -517,6 +614,13 @@ class Client:
                 if frame is None:
                     raise PeerClosed("peer disconnected")
                 kind, request_id, payload = frame
+
+                if kind == CALIB_QUERY:
+                    # Server-to-client device query; it references the
+                    # originating request id but is not a terminal reply, so it
+                    # must not consume the in-flight record.
+                    self._handle_calibration_query(request_id, payload)
+                    continue
 
                 with self._lock:
                     record = self._pending.get(request_id)
@@ -1298,6 +1402,77 @@ class SharedReads:
                 # Otherwise a member is already due: loop straight back.
 
 
+class Calibration:
+    """Process-local prepare/commit/dispose triple for calibrated conversions.
+
+    ``prepare(payload)`` returns ``(state, query)``; ``state`` is an in-process
+    business object never put on the wire and ``query`` is the at most 32768
+    byte device question sent back to the originating client.  After the device
+    answer arrives, ``commit(state, answer)`` produces the ordinary reply bytes;
+    ``dispose(state)`` releases the temporary workspace exactly once.  One
+    instance may back any number of concurrent ``serve`` connections; each
+    connection keeps its own bounded set of in-flight conversions.
+    """
+
+    __slots__ = ("prepare", "commit", "dispose")
+
+    def __init__(self, prepare, commit, dispose):
+        if not (callable(prepare) and callable(commit) and callable(dispose)):
+            raise ValueError(
+                "prepare, commit and dispose must all be callable"
+            )
+        self.prepare = prepare
+        self.commit = commit
+        self.dispose = dispose
+
+
+class _CalibJob:
+    """One accepted calibrated conversion, from admission until its slot frees."""
+
+    __slots__ = (
+        "request_id",
+        "payload",
+        "cond",
+        "answered",
+        "answer",
+        "answer_failed",
+        "reader_missing",
+        "query",
+        "enqueued",
+    )
+
+    def __init__(self, request_id, payload):
+        self.request_id = request_id
+        self.payload = payload
+        self.cond = Condition()
+        # Device-answer bookkeeping.  answer_failed distinguishes the two
+        # empty control replies (no reader / failed read) from a legal empty
+        # bytes answer; reader_missing says which of the two failures it was.
+        self.answered = False
+        self.answer = b""
+        self.answer_failed = False
+        self.reader_missing = False
+        self.query = None
+        self.enqueued = False
+
+
+class _CalibChannel:
+    """Per-connection state for the single device-question channel.
+
+    Holding the mutable queue/flag on one object avoids Python's
+    local-variable capture rules inside serve's nested functions: every helper
+    mutates *attributes* rather than rebinding closure names.
+    """
+
+    __slots__ = ("lock", "waiting", "channel_busy")
+
+    def __init__(self):
+        self.lock = Lock()
+        # Jobs whose query has been produced but not yet handed to the caller.
+        self.waiting = deque()
+        # True while one complete query body is outstanding toward the caller.
+        self.channel_busy = False
+
 
 def serve(
     sock,
@@ -1309,6 +1484,8 @@ def serve(
     rollout=None,
     resource_gate=None,
     shared_reads=None,
+    calibration=None,
+    calibration_slots=4,
 ):
     """Own sock; answer ordinary calls, bounded streams, and deliveries.
 
@@ -1331,6 +1508,13 @@ def serve(
     When *shared_reads* is given, SHARED_READ frames join its coalescing
     readers; a joined request needs neither a worker permit nor a global read
     slot, and each request keeps its own server-measured deadline.
+
+    When *calibration* is given, CALIB_REQUEST frames run its prepare/commit/
+    dispose callbacks: after prepare the server asks the originating client
+    for one device answer over this same connection and only commits once a
+    legal answer arrives.  At most *calibration_slots* accepted conversions
+    may be in flight on this connection at once; waiting for an execution
+    permit or a device answer occupies no worker permit.
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be positive")
@@ -1357,6 +1541,16 @@ def serve(
         shared_reads, SharedReads
     ):
         raise ValueError("shared_reads must be a SharedReads or None")
+    if calibration is not None and not isinstance(calibration, Calibration):
+        raise ValueError("calibration must be a Calibration or None")
+    if (
+        isinstance(calibration_slots, bool)
+        or type(calibration_slots) is not int
+        or not 1 <= calibration_slots <= 16
+    ):
+        raise ValueError(
+            "calibration_slots must be an integer from 1 to 16"
+        )
 
     writing = Lock()
     work_slots = BoundedSemaphore(workers)
@@ -1370,6 +1564,12 @@ def serve(
     delivery_waiters_lock = Lock()
     gate_attached = False
     shared_attached = False
+
+    # Calibration bookkeeping for this one connection.
+    calib_slots = BoundedSemaphore(calibration_slots)
+    calib_jobs = {}
+    calib_jobs_lock = Lock()
+    calib = _CalibChannel()
 
     def write_frame(kind, request_id, body=b""):
         with writing:
@@ -1417,6 +1617,233 @@ def serve(
         # frame; per-request deadlines start now, independently of any other
         # member and of the reader's own runtime.
         shared_reads.accept(shared_conn, request_id, payload, wait_ms)
+
+    # ---- calibrated conversions ----
+    #
+    # Chosen handoff policy: query bodies are never handed off early.  The
+    # single device channel is represented by one "credit": a CALIB_QUERY body
+    # is written only when no earlier query is outstanding, and the credit only
+    # returns when that read's terminal answer/control frame arrives.  Hence at
+    # every instant at most one complete, not-yet-read query body is in flight
+    # toward the caller -- in fact zero in steady handoff, because a new body is
+    # not written until the previous read finished.  No ordinary frame traffic
+    # is blocked to maintain this bound: arbitration lives entirely in the
+    # accept loop and the waits park on conditions.
+
+    def handle_calibration_request(request_id, body):
+        if calibration is None:
+            # Frame-by-frame rejection keeps the connection usable.
+            send_error(request_id, _CALIB_UNAVAILABLE)
+            return
+        if not calib_slots.acquire(blocking=False):
+            # Admission failure runs no prepare and reserves no state.
+            send_error(request_id, _CALIB_BUSY)
+            return
+        job = _CalibJob(request_id, body)
+        with calib_jobs_lock:
+            calib_jobs[request_id] = job
+        # Each accepted conversion gets its own daemon thread, mirroring the
+        # stream design: waiting for an execution permit or the device answer
+        # then occupies neither a pool thread nor a worker permit, so with
+        # workers=1 several admitted conversions can coexist.  Every callback
+        # still takes one of the existing worker permits for its duration and
+        # so counts against this connection's workers without adding slots.
+        thread = Thread(
+            target=calib_main,
+            args=(job,),
+            name=f"rpc-calib-{request_id}",
+            daemon=True,
+        )
+        with threads_lock:
+            runner_threads.add(thread)
+        try:
+            thread.start()
+        except Exception:
+            with threads_lock:
+                runner_threads.discard(thread)
+            with calib_jobs_lock:
+                calib_jobs.pop(request_id, None)
+            calib_slots.release()
+            send_error(request_id, b"server busy")
+
+    def calib_main(job):
+        try:
+            run_calibration(job)
+        finally:
+            with threads_lock:
+                runner_threads.discard(current_thread())
+
+    def pump_calibration():
+        """Hand one queued query to the caller if the device channel is free.
+
+        Called from the accept loop whenever a job becomes queued or a device
+        answer frees the channel.  The send itself happens outside the channel
+        lock so socket backpressure never blocks arbitration state.
+        """
+        with calib.lock:
+            if stopping.is_set() or calib.channel_busy or not calib.waiting:
+                return
+            job = calib.waiting.popleft()
+            calib.channel_busy = True
+            query = job.query
+        try:
+            write_frame(CALIB_QUERY, job.request_id, query)
+        except OSError:
+            _terminate(sock)
+
+    def deliver_calib_answer(request_id, answer, failed, reader_missing):
+        with calib_jobs_lock:
+            job = calib_jobs.get(request_id)
+        if job is None:
+            # A reply for an unknown/already-gone id is a protocol violation.
+            raise ProtocolError("unexpected calibration reply id")
+        with job.cond:
+            if job.answered:
+                raise ProtocolError("duplicate calibration reply")
+            job.answered = True
+            job.answer_failed = failed
+            job.reader_missing = reader_missing
+            if not failed:
+                job.answer = answer
+            job.cond.notify_all()
+        # The single device channel is free again; hand off the next queued
+        # query, if any.  A failed/control answer frees it identically.
+        with calib.lock:
+            calib.channel_busy = False
+        pump_calibration()
+
+    def run_calibration(job):
+        """Drive one accepted conversion through prepare, read, commit, cleanup.
+
+        Every prepare/commit/dispose execution takes one of this connection's
+        existing worker permits for its duration only; waiting for a permit or
+        for the device answer holds none.  Once prepare produced a state,
+        dispose(state) runs exactly once and never overlaps that state's
+        commit; the terminal reply is written only after cleanup exits.
+        """
+        state = None
+        state_acquired = False
+        terminal_kind = ERROR
+        terminal_body = _CALIB_HANDLER_FAILED
+        try:
+            # --- prepare (counts as one worker execution) ---
+            while not work_slots.acquire(timeout=0.05):
+                if stopping.is_set():
+                    return
+            try:
+                if stopping.is_set():
+                    return
+                try:
+                    prepared = calibration.prepare(job.payload)
+                except Exception:
+                    return
+                if (
+                    type(prepared) is not tuple
+                    or len(prepared) != 2
+                ):
+                    return
+                state, query = prepared
+                state_acquired = True
+                if (
+                    not isinstance(query, bytes)
+                    or len(query) > CALIB_MAX_PAYLOAD
+                ):
+                    # A state was acquired together with the illegal query;
+                    # cleanup below is still mandatory.
+                    return
+            finally:
+                work_slots.release()
+
+            # --- queue the device question and wait for its single answer ---
+            job.query = query
+            with calib.lock:
+                if stopping.is_set():
+                    return
+                calib.waiting.append(job)
+                job.enqueued = True
+            pump_calibration()
+
+            with job.cond:
+                while not job.answered:
+                    if stopping.is_set():
+                        return
+                    job.cond.wait(0.05)
+                answer_failed = job.answer_failed
+                reader_missing = job.reader_missing
+                answer = job.answer
+
+            if answer_failed:
+                # No legal answer: commit must never run.  The client already
+                # said which failure it was.
+                if reader_missing:
+                    terminal_body = _CALIB_READER_UNAVAILABLE
+                else:
+                    terminal_body = _CALIB_READ_FAILED
+                return
+
+            # --- commit (counts as one worker execution) ---
+            while not work_slots.acquire(timeout=0.05):
+                if stopping.is_set():
+                    # Once the connection has ended, no new commit may start.
+                    return
+            try:
+                if stopping.is_set():
+                    return
+                try:
+                    value = calibration.commit(state, answer)
+                except Exception:
+                    return
+                if not _payload(value):
+                    return
+                terminal_kind = RESULT
+                terminal_body = value
+            finally:
+                work_slots.release()
+        finally:
+            if state_acquired:
+                # Cleanup takes a worker permit like every other callback and
+                # is the only place dispose is ever invoked for this state, so
+                # it can never overlap that state's commit (the runner above
+                # reaches here only after commit fully returned or without ever
+                # starting it).  It keeps running after disconnect and the
+                # library does not wait on the remote device for it.
+                while not work_slots.acquire(timeout=0.05):
+                    if stopping.is_set():
+                        # The connection is tearing down; pool work is bounded
+                        # and every held permit returns, so retry until the
+                        # shared permit accounting frees one rather than
+                        # bypassing it.
+                        continue
+                try:
+                    try:
+                        calibration.dispose(state)
+                    except Exception:
+                        # dispose is contracted to return normally; swallow any
+                        # deviation so cleanup still counts as finished.
+                        pass
+                finally:
+                    work_slots.release()
+
+            with calib_jobs_lock:
+                calib_jobs.pop(job.request_id, None)
+            with calib.lock:
+                if job.enqueued:
+                    try:
+                        calib.waiting.remove(job)
+                    except ValueError:
+                        pass
+            calib_slots.release()
+
+            # Reply only after cleanup has exited and the slot freed.  On a
+            # dead connection the write fails harmlessly and teardown owns the
+            # future's PeerClosed delivery.
+            if not stopping.is_set():
+                try:
+                    write_frame(
+                        terminal_kind, job.request_id, terminal_body
+                    )
+                except OSError:
+                    _terminate(sock)
 
     def handle_request(request_id, body, generation=None):
         # When generation is given, the accept loop already holds one of its
@@ -1855,6 +2282,7 @@ def serve(
                         DELIVERY_CONFIRM,
                         SCOPED_REQUEST,
                         SHARED_READ,
+                        CALIB_REQUEST,
                     ):
                         if request_id <= last_id:
                             raise ProtocolError("expected increasing request ids")
@@ -1898,6 +2326,28 @@ def serve(
 
                     elif kind == SHARED_READ:
                         handle_shared_read(request_id, body)
+
+                    elif kind == CALIB_REQUEST:
+                        handle_calibration_request(request_id, body)
+
+                    elif kind == CALIB_ANSWER:
+                        if len(body) > CALIB_MAX_PAYLOAD:
+                            raise ProtocolError(
+                                "invalid calibration answer frame"
+                            )
+                        deliver_calib_answer(
+                            request_id, body, False, False
+                        )
+
+                    elif kind == CALIB_NO_READER:
+                        deliver_calib_answer(
+                            request_id, b"", True, True
+                        )
+
+                    elif kind == CALIB_READ_FAIL:
+                        deliver_calib_answer(
+                            request_id, b"", True, False
+                        )
 
                     elif kind == STREAM_OPEN:
                         if len(body) < 1:
@@ -1959,6 +2409,20 @@ def serve(
             finally:
                 _terminate(sock)
                 stopping.set()
+                # Calibration teardown: no new device read or commit may start
+                # from here.  Drop every queued, not-yet-sent query and wake
+                # every parked conversion so its runner proceeds straight to
+                # cleanup.  Conversions still inside prepare/commit run to their
+                # natural exit; each acquired state is disposed exactly once by
+                # its own runner, without waiting on the remote device or on an
+                # answer that can no longer be delivered.
+                with calib.lock:
+                    calib.waiting.clear()
+                with calib_jobs_lock:
+                    calib_pending = list(calib_jobs.values())
+                for job in calib_pending:
+                    with job.cond:
+                        job.cond.notify_all()
                 # Release this connection's gate wait slots and priority at
                 # once.  Already-started scoped callbacks are pool work: the
                 # pool context below keeps running until each exits, and their

@@ -20,6 +20,15 @@ SCOPED_REQUEST = 11
 # milliseconds followed by an at most 65534-byte payload (empty is allowed).
 # Replies reuse RESULT/ERROR.
 SHARED_READ = 12
+# Calibration extension.  CALIB_REQUEST carries the ordinary at most 65536-byte
+# payload from client to server; its terminal reply reuses RESULT/ERROR.  The
+# server then asks the originating client for device data with CALIB_QUERY
+# (at most 32768 bytes, empty allowed) keyed by the original request id, and
+# the client answers with CALIB_ANSWER (same size bound).  CALIB_NO_READER and
+# CALIB_READ_FAIL are empty-bodied control frames carrying no query text.
+CALIB_REQUEST, CALIB_QUERY, CALIB_ANSWER = 13, 14, 15
+CALIB_NO_READER, CALIB_READ_FAIL = 16, 17
+CALIB_MAX_PAYLOAD = 32768
 DELIVERY_SEQ_SIZE = 8
 MAX_PAYLOAD = 65536
 DELIVERY_MAX_PAYLOAD = MAX_PAYLOAD - DELIVERY_SEQ_SIZE
@@ -47,9 +56,16 @@ _FRAME_KINDS = frozenset(
         DELIVERY_CONFIRM,
         SCOPED_REQUEST,
         SHARED_READ,
+        CALIB_REQUEST,
+        CALIB_QUERY,
+        CALIB_ANSWER,
+        CALIB_NO_READER,
+        CALIB_READ_FAIL,
     }
 )
-_EMPTY_BODY_KINDS = frozenset({STREAM_END, STREAM_CANCEL, STREAM_CREDIT})
+_EMPTY_BODY_KINDS = frozenset(
+    {STREAM_END, STREAM_CANCEL, STREAM_CREDIT, CALIB_NO_READER, CALIB_READ_FAIL}
+)
 
 
 class ProtocolError(ConnectionError):
@@ -99,6 +115,14 @@ def receive(sock):
         # validated in rpc.py once the body is complete.
         if length < SHARED_READ_WAIT_SIZE or length > MAX_PAYLOAD:
             raise ProtocolError("invalid shared read frame")
+    elif kind == CALIB_REQUEST:
+        # Same body contract as an ordinary REQUEST.
+        if length > MAX_PAYLOAD:
+            raise ProtocolError("invalid calibration request frame")
+    elif kind in (CALIB_QUERY, CALIB_ANSWER):
+        # Device query/answer text; empty bytes are legal.
+        if length > CALIB_MAX_PAYLOAD:
+            raise ProtocolError("invalid calibration data frame")
     elif length > MAX_PAYLOAD:
         raise ProtocolError("invalid frame header")
     return kind, request_id, read_exact(sock, length)
